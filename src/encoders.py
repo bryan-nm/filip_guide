@@ -158,29 +158,65 @@ def encode_text_batch(
 # ---------------------------------------------------------------------------
 # Protein encoder: ESM-C 300M
 # ---------------------------------------------------------------------------
+def _ensure_esm_registered() -> bool:
+    """Import `esm` for its side effect of registering the `esmc` architecture.
+
+    Loud on failure (unlike a silent pass): if `import esm` errors on a host, that
+    is exactly why AutoModelForMaskedLM later can't find `esmc`, and we want it in
+    the log rather than swallowed.
+    """
+    try:
+        import esm  # noqa: F401
+        return True
+    except Exception as e:
+        print(f"[encoders] WARNING: `import esm` failed ({type(e).__name__}: {e}); "
+              f"the `esmc` architecture may be unregistered. If ESM-C fails to load, "
+              f"install/repair esm: pip install 'esm @ git+https://github.com/Biohub/esm.git@main'",
+              flush=True)
+        return False
+
+
+def _load_esmc_tokenizer(path: str):
+    """Load the ESM-C tokenizer robustly across transformers versions.
+
+    The checkpoint's tokenizer_config names `tokenizer_class: "ESMCTokenizer"`.
+    Some transformers builds resolve that via a generic fast-tokenizer fallback;
+    others (e.g. Aurora's `frameworks` build) raise "ESMCTokenizer does not exist".
+    So we try AutoTokenizer, then fall back to building a plain fast tokenizer
+    straight from tokenizer.json + special_tokens_map.json — which ignores the
+    class name entirely and yields identical vocab/specials (cls 0, eos 2, pad 1,
+    unk 3, `|` 31, mask 32; post-processor adds cls/eos).
+    """
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+    try:
+        return AutoTokenizer.from_pretrained(path)
+    except Exception as e:
+        print(f"[encoders] AutoTokenizer failed ({type(e).__name__}); falling back to "
+              f"PreTrainedTokenizerFast from tokenizer.json", flush=True)
+        return PreTrainedTokenizerFast.from_pretrained(path)
+
+
 def load_protein_encoder(path: str, device: torch.device):
     """Load frozen ESM-C via transformers `AutoModelForMaskedLM` + its tokenizer.
 
-    Importing `esm` registers the `esmc` architecture into transformers; we do it
-    defensively (it is a no-op if transformers already knows `esmc`) and turn the
-    "unrecognized architecture" failure into an actionable message.
+    Importing `esm` registers the `esmc` architecture into transformers. The
+    tokenizer is loaded version-robustly (see `_load_esmc_tokenizer`).
     """
-    from transformers import AutoModelForMaskedLM, AutoTokenizer
+    from transformers import AutoModelForMaskedLM
 
-    try:
-        import esm  # noqa: F401  (side effect: registers `esmc` into transformers)
-    except Exception:
-        pass  # newer transformers may know `esmc` natively; surface any real error below
-
-    tok = AutoTokenizer.from_pretrained(path)
+    _ensure_esm_registered()
+    tok = _load_esmc_tokenizer(path)
     try:
         model = AutoModelForMaskedLM.from_pretrained(path).eval().to(device)
     except (ValueError, KeyError) as e:
         raise RuntimeError(
             f"Could not load ESM-C from {path!r}: {e}\n"
-            "The `esmc` architecture must be registered into transformers. Install "
-            "the esm package into this environment:\n"
-            "    pip install esm@git+https://github.com/Biohub/esm.git@main"
+            "The `esmc` architecture must be registered into transformers (via the "
+            "`esm` package) AND transformers must be >=4.57. On Aurora the venv may "
+            "be using the older `frameworks` transformers via --system-site-packages; "
+            "force a venv-local upgrade:\n"
+            "    pip install --upgrade --force-reinstall --no-deps 'transformers>=4.57'\n"
+            "    pip install 'esm @ git+https://github.com/Biohub/esm.git@main'"
         ) from e
 
     for p in model.parameters():

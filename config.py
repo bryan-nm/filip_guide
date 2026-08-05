@@ -28,14 +28,14 @@ REPO_ROOT = Path(__file__).resolve().parent
 # so the log always records which models and corpus a run actually read. The
 # FILIP_* / FILIPG_* env vars are an escape hatch for hosts whose models live
 # elsewhere; no job script sets them.
-MODELS_DIR = os.environ.get("FILIPG_MODELS_DIR", "/Users/bryan/Documents/models")
-DATASETS_DIR = os.environ.get("FILIPG_DATASETS_DIR", "/Users/bryan/Documents/datasets")
+MODELS_DIR = os.environ.get("FILIPG_MODELS_DIR", "/flare/NLDesignProtein/bryan/FILIP-dev-space/models")
+DATASETS_DIR = os.environ.get("FILIPG_DATASETS_DIR", "/flare/NLDesignProtein/bryan/FILIP-dev-space/datasets")
 
 # One row per (protein, caption) pair. This build is filtered to 30..500 residues,
 # which lets max_protein_tokens sit at 512 (+cls/eos) with nothing truncated.
 DATA_CSV = os.environ.get(
     "FILIPG_DATA_CSV",
-    f"{DATASETS_DIR}/SwissProt_full/fully_annotated_swiss_prot_LEGACY_UPDATE_20260505_len30to500.csv",
+    f"{DATASETS_DIR}/SwissProt_full/fully_annotated_swiss_prot_080326.csv",
 )
 
 # ESM-C is loaded through the transformers API (AutoModelForMaskedLM); the `esm`
@@ -194,13 +194,16 @@ def default_cfg() -> Cfg:
 # ---------------------------------------------------------------------------
 def resolved_paths(cfg: Cfg | None = None) -> dict:
     cfg = cfg or default_cfg()
+    # NOTE: there is no embedding cache / precompute step — ESM-C is encoded live
+    # every step (masking makes it uncacheable), so cache_dir is intentionally not
+    # listed here. Only inputs the run actually reads + the checkpoint sink.
     return {
         "models_dir": MODELS_DIR,
         "datasets_dir": DATASETS_DIR,
         "text_encoder": cfg.model.text_encoder_path,
         "protein_encoder": cfg.model.protein_encoder_path,
         "data_csv": cfg.data.csv_path,
-        "cache_dir": cfg.retrieval.cache_dir,
+        "ckpt_dir": cfg.retrieval.ckpt_dir,
     }
 
 
