@@ -1,0 +1,26 @@
+# Dedicated env for filip_guide. Kept separate from `mini-embed-filip` because the
+# `esm` package (which registers the ESM-C architecture into transformers) may pin
+# a different transformers version.
+#
+#   conda env create -f environment.yml
+#   conda activate filip_guide
+#
+# The esm package is what unlocks the transformers-native ESM-C load
+# (AutoModelForMaskedLM on biohub/ESMC-300M); see src/encoders.py.
+name: filip_guide
+channels:
+  - conda-forge
+dependencies:
+  # esm requires >=3.12,<3.13 (matches the proteingen toolchain).
+  - python=3.12
+  - pip
+  - pip:
+      - torch>=2.4
+      - transformers>=4.57
+      - tokenizers
+      - safetensors
+      - numpy
+      - pandas
+      # Registers the `esmc` architecture into transformers. Pulls its own
+      # transformers pin if it needs one.
+      - esm @ git+https://github.com/Biohub/esm.git@main

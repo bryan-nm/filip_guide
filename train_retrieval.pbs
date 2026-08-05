@@ -1,0 +1,73 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N filip_guide_retrieval
+#PBS -l walltime=12:00:00
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fsx
+#PBS -q capacity
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m be
+
+# ---------------------------------------------------------------------------
+# Two-phase mask-aware FILIP retrieval training over the full SwissProt corpus.
+#
+# 16 nodes x 12 ranks = 192 ranks, in 12 contrastive subgroups of 16. ESM-C is
+# encoded LIVE every step (masking makes its output uncacheable), so unlike
+# mini-embed there is no precompute/cache step and the CSV IS read every run
+# (once per rank at startup). Model/dataset paths are owned by config.py.
+#
+# Walltime is an estimate (~267 steps/epoch/rank at B=8; ESM-C-300M forward
+# dominates). If the queue caps walltime before 20 epochs finish, just re-submit:
+# `--resume auto` picks up the latest checkpoint in CKPT_DIR.
+# ---------------------------------------------------------------------------
+
+MASTER_PORT=29501
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./pbs_common.sh
+
+# ===========================================================================
+# Outputs
+# ===========================================================================
+CKPT_DIR=checkpoints/retrieval
+
+# ===========================================================================
+# Hyperparameters
+# ===========================================================================
+# Global negatives per anchor = GROUP_SIZE * BATCH_SIZE = 128. BATCH_SIZE is
+# conservative for the live ESM-C-300M forward on one XPU tile; raise to 16
+# (=> 256 negatives) if memory heads-room allows. FILIP_CHUNK_ROWS caps the
+# [chunk, GROUP*BS, L_p, L_t] transient.
+BATCH_SIZE=8
+GROUP_SIZE=16
+PHASE1_EPOCHS=1
+PHASE2_EPOCHS=19
+LR=2e-4
+# R1 token-spread weight; raise toward 0.3 if R1 collapses.
+PHASE1_UNIFORMITY_WEIGHT=0.3
+# At this scale the R2 contrastive objective carries the geometry on its own.
+R2_UNIFORMITY_WEIGHT=0
+ALIGN_AUX_WEIGHT=0
+FILIP_CHUNK_ROWS=8
+VAL_SUBSET=500
+
+# ===========================================================================
+command -v slack >/dev/null 2>&1 && slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+job_banner "filip_guide retrieval training (src.train_retrieval)" \
+    CKPT_DIR BATCH_SIZE GROUP_SIZE PHASE1_EPOCHS PHASE2_EPOCHS LR \
+    PHASE1_UNIFORMITY_WEIGHT R2_UNIFORMITY_WEIGHT ALIGN_AUX_WEIGHT \
+    FILIP_CHUNK_ROWS VAL_SUBSET
+
+"${MPI_LAUNCH[@]}" \
+    python -m src.train_retrieval --device xpu --resume auto \
+        --ckpt-dir "${CKPT_DIR}" \
+        --batch-size "${BATCH_SIZE}" --group-size "${GROUP_SIZE}" \
+        --phase1-epochs "${PHASE1_EPOCHS}" --phase2-epochs "${PHASE2_EPOCHS}" \
+        --lr "${LR}" \
+        --phase1-uniformity-weight "${PHASE1_UNIFORMITY_WEIGHT}" \
+        --r2-uniformity-weight "${R2_UNIFORMITY_WEIGHT}" \
+        --align-aux-weight "${ALIGN_AUX_WEIGHT}" \
+        --filip-chunk-rows "${FILIP_CHUNK_ROWS}" --val-subset "${VAL_SUBSET}"
+
+finish $?
