@@ -87,14 +87,40 @@ def _map(scores: torch.Tensor, rel: torch.Tensor) -> float:
 @torch.no_grad()
 def retrieval_metrics(z_p, mask_p, z_t, mask_t, acc_ids, txt_ids,
                       chunk_rows: int = 16) -> dict:
-    """R@1/5/10 + mAP in both directions on an N-pair evaluation set."""
+    """R@1/5/10 + mAP in both directions, plus collapse diagnostics.
+
+    Collapse tells: `pos`/`neg` are the mean FILIP similarity of true pairs vs
+    true-negative pairs, and `gap = pos - neg` is the discriminability the whole
+    model rests on (gap -> 0 with pos high == the space collapsed). `unif_p`/
+    `unif_t` are Wang-Isola token uniformity per modality (more negative = more
+    spread; near 0 = crowded).
+    """
+    from .losses import token_uniformity_loss, pool_normalize
     S = filip_score_matrix_chunked(z_p, z_t, mask_p, mask_t, chunk_rows)   # [N_p, N_t]
     rel = _relevance(acc_ids, txt_ids)
     p2t = _recall_at_k(S, rel)
     t2p = _recall_at_k(S.t(), rel.t())
+    pos = S.diagonal().mean().item()
+    neg = S[~rel].mean().item() if (~rel).any() else 0.0
+
+    # Position-pooled geometry: matched/mismatched cross-modal cosine, and the
+    # intra-modal anisotropy (mean pairwise cosine within a modality — the direct
+    # "is the cone collapsing" read; near 1.0 = collapsed) + modality-gap L2.
+    up, ut = pool_normalize(z_p, mask_p), pool_normalize(z_t, mask_t)      # [N, D]
+    Cx = up @ ut.t()
+    N = up.size(0)
+    off = ~torch.eye(N, dtype=torch.bool, device=up.device)
     return {
         "p2t_R@1": p2t[1], "p2t_R@5": p2t[5], "p2t_R@10": p2t[10], "p2t_mAP": _map(S, rel),
         "t2p_R@1": t2p[1], "t2p_R@5": t2p[5], "t2p_R@10": t2p[10], "t2p_mAP": _map(S.t(), rel.t()),
+        "pos": pos, "neg": neg, "gap": pos - neg,
+        "cos_pos": Cx.diagonal().mean().item(),
+        "cos_neg": Cx[~rel].mean().item() if (~rel).any() else 0.0,
+        "aniso_p": (up @ up.t())[off].mean().item() if N > 1 else 0.0,
+        "aniso_t": (ut @ ut.t())[off].mean().item() if N > 1 else 0.0,
+        "modality_gap": (up.mean(0) - ut.mean(0)).norm().item(),
+        "unif_p": token_uniformity_loss(z_p, mask_p).item(),
+        "unif_t": token_uniformity_loss(z_t, mask_t).item(),
         "n": S.size(0),
     }
 

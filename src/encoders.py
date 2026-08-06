@@ -19,6 +19,9 @@ token-level max-sim. `include_masked=True` keeps them for the ablation.
 """
 from __future__ import annotations
 
+import contextlib
+import io
+import sys
 from typing import List, Optional, Sequence
 
 import torch
@@ -26,19 +29,32 @@ import torch.nn as nn
 
 
 def _quiet_transformers() -> None:
-    """Raise transformers' log threshold to ERROR before loading the encoders.
-
-    Suppresses the cosmetic spam that otherwise floods the job log: the
-    "🚨 No checkpoint found for ESMCForTokenClassification.forward ... auto_docstring"
-    advisories (emitted once per rank for ESM-C's unused classification heads —
-    NOT a weight-loading or checkpoint problem) and the BioLinkBERT
-    embedding-resize notice. Real errors are ERROR-level and still surface.
+    """Raise transformers' logger threshold to ERROR (suppresses logger-based
+    notices like the BioLinkBERT embedding-resize message). Does NOT cover the
+    ESM-C `auto_docstring` spam — that is emitted with a bare `print()`, so it
+    needs `_silence_stdout` instead. Real errors are ERROR-level and still show.
     """
     try:
         from transformers.utils import logging as hf_logging
         hf_logging.set_verbosity_error()
     except Exception:
         pass
+
+
+@contextlib.contextmanager
+def _silence_stdout():
+    """Swallow bare-`print()` spam on stdout for the duration of the block.
+
+    transformers' auto_docstring emits "🚨 No checkpoint found for
+    ESMCForTokenClassification.forward ... auto_docstring" via `print()` at ESM-C
+    class-definition time (transformers/utils/auto_docstring.py) — once per rank
+    for ESM-C's unused classification heads. It is NOT a weight/checkpoint problem
+    and no logging-level control silences a bare print; only redirecting stdout
+    does. stderr is left untouched so genuine errors (and our stderr warnings)
+    still surface. Per-process (per-rank) under MPI, so every rank self-silences.
+    """
+    with contextlib.redirect_stdout(io.StringIO()):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -183,13 +199,15 @@ def _ensure_esm_registered() -> bool:
     the log rather than swallowed.
     """
     try:
-        import esm  # noqa: F401
+        with _silence_stdout():             # ESM-C class-def auto_docstring prints fire here
+            import esm  # noqa: F401
         return True
     except Exception as e:
+        # stderr, not stdout: this is signal, and _silence_stdout only redirects stdout.
         print(f"[encoders] WARNING: `import esm` failed ({type(e).__name__}: {e}); "
               f"the `esmc` architecture may be unregistered. If ESM-C fails to load, "
               f"install/repair esm: pip install 'esm @ git+https://github.com/Biohub/esm.git@main'",
-              flush=True)
+              file=sys.stderr, flush=True)
         return False
 
 
@@ -225,7 +243,9 @@ def load_protein_encoder(path: str, device: torch.device):
     _ensure_esm_registered()
     tok = _load_esmc_tokenizer(path)
     try:
-        model = AutoModelForMaskedLM.from_pretrained(path).eval().to(device)
+        with _silence_stdout():             # auto_docstring may also fire on first class import here
+            model = AutoModelForMaskedLM.from_pretrained(path)
+        model = model.eval().to(device)
     except (ValueError, KeyError) as e:
         raise RuntimeError(
             f"Could not load ESM-C from {path!r}: {e}\n"

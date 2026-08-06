@@ -25,6 +25,37 @@ _NEG = -1e4
 
 
 # ---------------------------------------------------------------------------
+# Position-pooled sequence embeddings (plain cosine geometry, no late interaction)
+# ---------------------------------------------------------------------------
+def pool_normalize(z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Mean-pool per-token embeddings over VALID positions, then L2-normalize.
+
+    Collapses [B, L, D] -> [B, D]: one unit vector per sequence. This is the
+    geometry FILIP's mean-of-max obscures — inspecting these directly (matched vs
+    mismatched cosine, and intra-modal spread) is the clearest read on whether the
+    space is collapsing into a cone.
+    """
+    w = mask.unsqueeze(-1).to(z.dtype)
+    pooled = (z * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
+    return F.normalize(pooled, p=2, dim=-1)
+
+
+def pooled_pos_neg(z_p, mask_p, z_t, mask_t):
+    """Mean cosine of position-pooled embeddings for matched (pos) vs mismatched
+    (neg) cross-modal pairs in a batch. Returns (cos_pos, cos_neg)."""
+    up = pool_normalize(z_p, mask_p)              # [B, D]
+    ut = pool_normalize(z_t, mask_t)              # [B, D]
+    C = up @ ut.t()                               # [B, B]
+    pos = C.diagonal().mean()
+    if C.size(0) > 1:
+        eye = torch.eye(C.size(0), dtype=torch.bool, device=C.device)
+        neg = C[~eye].mean()
+    else:
+        neg = torch.zeros((), device=C.device)
+    return pos, neg
+
+
+# ---------------------------------------------------------------------------
 # FILIP score (per-pair scalar similarity in [-1, 1])
 # ---------------------------------------------------------------------------
 def filip_score_matrix(
@@ -140,7 +171,12 @@ def phase_r1_loss(
 ) -> dict:
     """Phase R1 warmup: maximize positive-pair FILIP + token uniformity + recon."""
     z_p, z_t = out["z_p"], out["z_t"]
-    filip_pos = filip_score_matrix(z_p, z_t, mask_p, mask_t).diagonal().mean()
+    M = filip_score_matrix(z_p, z_t, mask_p, mask_t)          # [B, B]
+    filip_pos = M.diagonal().mean()
+    with torch.no_grad():
+        eye = torch.eye(M.size(0), dtype=torch.bool, device=M.device)
+        filip_neg = M[~eye].mean() if M.size(0) > 1 else torch.zeros((), device=M.device)
+        cos_pos, cos_neg = pooled_pos_neg(z_p, mask_p, z_t, mask_t)
     l_align = 1.0 - filip_pos
     l_unif = 0.5 * (token_uniformity_loss(z_p, mask_p, uniformity_t)
                     + token_uniformity_loss(z_t, mask_t, uniformity_t))
@@ -149,7 +185,10 @@ def phase_r1_loss(
     total = l_align + uniformity_weight * l_unif + recon_weight * l_recon
     return {"loss": total, "align": l_align, "unif": l_unif, "recon": l_recon,
             "nce": torch.zeros((), device=z_p.device),
-            "acc": torch.zeros((), device=z_p.device), "filip_pos": filip_pos}
+            "acc": torch.zeros((), device=z_p.device),
+            "filip_pos": filip_pos, "filip_neg": filip_neg,
+            "filip_gap": filip_pos - filip_neg,
+            "cos_pos": cos_pos, "cos_neg": cos_neg}
 
 
 def phase_r2_loss(
@@ -178,6 +217,10 @@ def phase_r2_loss(
                      + (logits_tp.argmax(-1) == target).float().mean())
 
     filip_pos = filip_mat.diagonal().mean()
+    with torch.no_grad():
+        eye = torch.eye(filip_mat.size(0), dtype=torch.bool, device=filip_mat.device)
+        filip_neg = filip_mat[~eye].mean() if filip_mat.size(0) > 1 else torch.zeros((), device=z_p.device)
+        cos_pos, cos_neg = pooled_pos_neg(z_p, mask_p, z_t, mask_t)
     l_align = 1.0 - filip_pos
     l_recon = 0.5 * (reconstruction_loss(out["h_p_hat"], h_p, mask_p)
                      + reconstruction_loss(out["h_t_hat"], h_t, mask_t))
@@ -190,7 +233,8 @@ def phase_r2_loss(
     total = (l_nce + align_aux_weight * l_align + recon_weight * l_recon
              + uniformity_weight * l_unif)
     return {"loss": total, "align": l_align, "unif": l_unif, "recon": l_recon,
-            "nce": l_nce, "acc": acc, "filip_pos": filip_pos}
+            "nce": l_nce, "acc": acc, "filip_pos": filip_pos, "filip_neg": filip_neg,
+            "filip_gap": filip_pos - filip_neg, "cos_pos": cos_pos, "cos_neg": cos_neg}
 
 
 def phase_r2_loss_grouped(
@@ -233,11 +277,19 @@ def phase_r2_loss_grouped(
                                      text_groups, text_groups_all)
     l_nce = 0.5 * (F.cross_entropy(logits_pt, target) + F.cross_entropy(logits_tp, target))
 
+    filip_pos = mat_p2t.gather(1, target[:, None]).squeeze(1).mean()
     with torch.no_grad():
         acc = 0.5 * ((logits_pt.argmax(-1) == target).float().mean()
                      + (logits_tp.argmax(-1) == target).float().mean())
+        # Mean negative-pair FILIP similarity: all gathered columns except each
+        # anchor's own positive. The pos-neg gap is the collapse tell (gap -> 0
+        # while filip_pos stays high == the space has collapsed).
+        neg_mask = torch.ones_like(mat_p2t, dtype=torch.bool)
+        neg_mask[torch.arange(B, device=z_p.device), target] = False
+        filip_neg = mat_p2t[neg_mask].mean() if neg_mask.any() else torch.zeros((), device=z_p.device)
+        # Pooled-embedding cosine on the LOCAL matched batch (plain geometry).
+        cos_pos, cos_neg = pooled_pos_neg(z_p, mask_p, z_t, mask_t)
 
-    filip_pos = mat_p2t.gather(1, target[:, None]).squeeze(1).mean()
     l_align = 1.0 - filip_pos
     l_recon = 0.5 * (reconstruction_loss(h_p_hat, h_p, mask_p)
                      + reconstruction_loss(h_t_hat, h_t, mask_t))
@@ -250,4 +302,5 @@ def phase_r2_loss_grouped(
     total = (l_nce + align_aux_weight * l_align + recon_weight * l_recon
              + uniformity_weight * l_unif)
     return {"loss": total, "align": l_align, "unif": l_unif, "recon": l_recon,
-            "nce": l_nce, "acc": acc, "filip_pos": filip_pos}
+            "nce": l_nce, "acc": acc, "filip_pos": filip_pos, "filip_neg": filip_neg,
+            "filip_gap": filip_pos - filip_neg, "cos_pos": cos_pos, "cos_neg": cos_neg}

@@ -257,7 +257,10 @@ def train(cfg: Cfg, args) -> None:
             if env.is_main and ((it + 1) % cfg.retrieval.log_every == 0 or it == 0):
                 print(f"[{phase}] ep={epoch} step={it+1}/{steps_per_epoch} lr={lr:.2e} "
                       f"loss={res['loss'].item():.4f} nce={res['nce'].item():.4f} "
-                      f"acc={res['acc'].item():.3f} filip_pos={res['filip_pos'].item():.4f} "
+                      f"acc={res['acc'].item():.3f} "
+                      f"filip[p={res['filip_pos'].item():.3f} n={res['filip_neg'].item():.3f}] "
+                      f"cos[p={res['cos_pos'].item():.3f} n={res['cos_neg'].item():.3f}] "
+                      f"unif={res['unif'].item():.3f} "
                       f"recon={res['recon'].item():.4f} tau={core.logit_scale.exp().item():.2f}",
                       flush=True)
 
@@ -272,6 +275,11 @@ def train(cfg: Cfg, args) -> None:
                 include_masked_in_score=cfg.mask.include_masked_in_score)
             print(f"[val] ep={epoch} p2t R@1={m['p2t_R@1']:.3f} R@5={m['p2t_R@5']:.3f} "
                   f"mAP={m['p2t_mAP']:.3f} t2p R@1={m['t2p_R@1']:.3f} (n={m['n']})", flush=True)
+            print(f"[geo] ep={epoch} filip[p={m['pos']:.3f} n={m['neg']:.3f} gap={m['gap']:.3f}] "
+                  f"cos[p={m['cos_pos']:.3f} n={m['cos_neg']:.3f}] "
+                  f"aniso[p={m['aniso_p']:.3f} t={m['aniso_t']:.3f}] "
+                  f"mgap={m['modality_gap']:.3f} unif[p={m['unif_p']:.2f} t={m['unif_t']:.2f}]",
+                  flush=True)
             log.append({"epoch": epoch, "phase": phase, **m})
             if args.save:
                 ckpt_dir.mkdir(parents=True, exist_ok=True)

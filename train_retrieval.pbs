@@ -31,26 +31,31 @@ source ./pbs_common.sh
 # Outputs
 # ===========================================================================
 # Fresh dir so `--resume auto` starts clean rather than picking up the previous
-# (collapsed) run's checkpoints.
-CKPT_DIR=checkpoints/retrieval_center
+# (collapsed / centering-only) run's checkpoints.
+CKPT_DIR=checkpoints/retrieval_unif
 
 # ===========================================================================
 # Hyperparameters
 # ===========================================================================
-# ISOLATION RUN: these match the first full run EXACTLY so the only change vs it
-# is the centering fix (compute the de-anisotropizing mean under the training mask
-# schedule; src/train_retrieval.py). Do not touch these until the A/B is read.
-# Global negatives per anchor = GROUP_SIZE * BATCH_SIZE = 96.
+# Centering-under-masking alone did NOT break the collapse (filip_pos still ~0.97,
+# acc ~0.06). Now adding the output-space anti-collapse levers on top of it:
+#   item 2 - R2 uniformity + align (spread the token cloud; keep positives together)
+#   item 3 - bigger negative pool, 96 -> 192, via GROUP_SIZE (12 -> 24) NOT
+#            BATCH_SIZE: a larger group grows the negative pool + the (chunked)
+#            FILIP transient but does NOT raise the live ESM-C forward's per-tile
+#            memory, so it can't OOM the encoder. Raise BATCH_SIZE only if a tile
+#            has headroom. embed_dim left at 16 (unchanged).
 BATCH_SIZE=8
-GROUP_SIZE=12
+GROUP_SIZE=24
 PHASE1_EPOCHS=1
 PHASE2_EPOCHS=19
 LR=2e-4
 # R1 token-spread weight; raise toward 0.3 if R1 collapses.
 PHASE1_UNIFORMITY_WEIGHT=0.3
-# Kept at 0 (as in the first run) so the centering fix is tested in isolation.
-R2_UNIFORMITY_WEIGHT=0
-ALIGN_AUX_WEIGHT=0
+# The primary output-space fix: uniformity spreads the per-token cloud, align
+# keeps positives together without over-collapsing.
+R2_UNIFORMITY_WEIGHT=0.1
+ALIGN_AUX_WEIGHT=0.1
 FILIP_CHUNK_ROWS=8
 VAL_SUBSET=500
 
