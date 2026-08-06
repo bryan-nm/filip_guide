@@ -80,11 +80,8 @@ class ModelCfg:
     proj_d_hidden: int = 512
     proj_d_mid: int = 256
     # Width of the shared retrieval space, and the sweep variable. Nothing else in
-    # the repo hard-codes a value — every head reads it from here. Bumped 16 -> 64
-    # after the first full run collapsed (filip_pos ~0.97 with flat acc): 16-d is a
-    # tight bottleneck for token-level FILIP over a 456k-protein corpus and makes
-    # collapse easier. Try 128 if 64 still saturates.
-    embed_dim: int = 64
+    # the repo hard-codes a value — every head reads it from here.
+    embed_dim: int = 16
     proj_dropout: float = 0.1
 
     expand_d_mid: int = 256

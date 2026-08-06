@@ -30,30 +30,27 @@ source ./pbs_common.sh
 # ===========================================================================
 # Outputs
 # ===========================================================================
-# Fresh dir: embed_dim changed (16 -> 64), so the previous run's checkpoints are
-# shape-incompatible and `--resume auto` must not pick them up. Bump this suffix
-# whenever the model architecture changes.
-CKPT_DIR=checkpoints/retrieval_ed64
+# Fresh dir so `--resume auto` starts clean rather than picking up the previous
+# (collapsed) run's checkpoints.
+CKPT_DIR=checkpoints/retrieval_center
 
 # ===========================================================================
 # Hyperparameters
 # ===========================================================================
-# Global negatives per anchor = GROUP_SIZE * BATCH_SIZE. The first full run used
-# 8 x 12 = 96 and collapsed; bumped to 16 x 16 = 256. If the ESM-C-300M forward
-# OOMs on one XPU tile at B=16, drop BATCH_SIZE to 8 (=> 128) first.
-# FILIP_CHUNK_ROWS caps the [chunk, GROUP*BS, L_p, L_t] transient.
-BATCH_SIZE=16
-GROUP_SIZE=16
+# ISOLATION RUN: these match the first full run EXACTLY so the only change vs it
+# is the centering fix (compute the de-anisotropizing mean under the training mask
+# schedule; src/train_retrieval.py). Do not touch these until the A/B is read.
+# Global negatives per anchor = GROUP_SIZE * BATCH_SIZE = 96.
+BATCH_SIZE=8
+GROUP_SIZE=12
 PHASE1_EPOCHS=1
 PHASE2_EPOCHS=19
 LR=2e-4
 # R1 token-spread weight; raise toward 0.3 if R1 collapses.
 PHASE1_UNIFORMITY_WEIGHT=0.3
-# NON-ZERO now: the first run collapsed (filip_pos ~0.97, flat acc) with these at
-# 0. The uniformity term spreads the per-token cloud; align keeps positives
-# together without over-collapsing. These are the primary fix for the plateau.
-R2_UNIFORMITY_WEIGHT=0.1
-ALIGN_AUX_WEIGHT=0.1
+# Kept at 0 (as in the first run) so the centering fix is tested in isolation.
+R2_UNIFORMITY_WEIGHT=0
+ALIGN_AUX_WEIGHT=0
 FILIP_CHUNK_ROWS=8
 VAL_SUBSET=500
 
