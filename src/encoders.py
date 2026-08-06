@@ -25,6 +25,22 @@ import torch
 import torch.nn as nn
 
 
+def _quiet_transformers() -> None:
+    """Raise transformers' log threshold to ERROR before loading the encoders.
+
+    Suppresses the cosmetic spam that otherwise floods the job log: the
+    "🚨 No checkpoint found for ESMCForTokenClassification.forward ... auto_docstring"
+    advisories (emitted once per rank for ESM-C's unused classification heads —
+    NOT a weight-loading or checkpoint problem) and the BioLinkBERT
+    embedding-resize notice. Real errors are ERROR-level and still surface.
+    """
+    try:
+        from transformers.utils import logging as hf_logging
+        hf_logging.set_verbosity_error()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Text encoder: BioLinkBERT-base
 # ---------------------------------------------------------------------------
@@ -84,6 +100,7 @@ def load_text_encoder(path: str, device: torch.device,
     """
     from transformers import AutoModel, AutoTokenizer
 
+    _quiet_transformers()
     tok = AutoTokenizer.from_pretrained(path)
     model = AutoModel.from_pretrained(path).eval().to(device)
     _register_caption_field_labels(model, tok, field_labels or [])
@@ -204,6 +221,7 @@ def load_protein_encoder(path: str, device: torch.device):
     """
     from transformers import AutoModelForMaskedLM
 
+    _quiet_transformers()
     _ensure_esm_registered()
     tok = _load_esmc_tokenizer(path)
     try:

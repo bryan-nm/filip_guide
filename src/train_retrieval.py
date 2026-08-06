@@ -76,21 +76,31 @@ def encode_frozen(pmodel, ptok, tmodel, ttok, proteins, texts, device, cfg: Cfg,
 
 @torch.no_grad()
 def compute_feature_means(pmodel, ptok, tmodel, ttok, pairs: List[Pair], env, cfg: Cfg):
-    """Corpus-mean token vectors (valid, unmasked positions) for centering.
+    """Corpus-mean token vectors for centering, computed UNDER the training mask
+    schedule.
 
-    Sharded across ranks then SUM-all-reduced, so no rank does the whole sample
-    serially. Uses the first `means_sample` pairs, striped by rank.
+    Critical for our masked setup: ESM-C's dominant direction shifts sharply as a
+    sequence is masked (raw pairwise-cosine ~0.61 unmasked -> ~0.85 at 70% masked),
+    so a mean estimated on unmasked sequences under-corrects the masked features
+    the projection head actually sees at train time (leaves ~0.52 residual
+    anisotropy -> FILIP collapse). We therefore mask each sample with the SAME
+    t ~ Unif[mask_t_min, mask_t_max] schedule as training and average over the
+    revealed positions (the ones that feed FILIP). Sharded across ranks then
+    SUM-all-reduced.
     """
     sub = pairs[:cfg.retrieval.means_sample][env.rank::max(env.world_size, 1)]
     device = env.device
+    reveal_range = (cfg.mask.mask_t_min, cfg.mask.mask_t_max) if cfg.mask.enabled else None
     sum_p = torch.zeros(cfg.model.protein_hidden, device=device)
     sum_t = torch.zeros(cfg.model.text_hidden, device=device)
     cnt = torch.zeros(2, device=device)
     for s in range(0, len(sub), 16):
         chunk = sub[s:s + 16]
+        reveal = (masking.sample_mask_fractions(len(chunk), *reveal_range, device)
+                  if reveal_range else None)
         h_p, mask_p, h_t, mask_t = encode_frozen(
             pmodel, ptok, tmodel, ttok, [p.protein for p in chunk],
-            [p.text for p in chunk], device, cfg, reveal=None)
+            [p.text for p in chunk], device, cfg, reveal=reveal)
         sum_p += h_p[mask_p].sum(0).float(); cnt[0] += int(mask_p.sum())
         sum_t += h_t[mask_t].sum(0).float(); cnt[1] += int(mask_t.sum())
     all_reduce_sum(sum_p); all_reduce_sum(sum_t); all_reduce_sum(cnt)
@@ -246,9 +256,9 @@ def train(cfg: Cfg, args) -> None:
 
             if env.is_main and ((it + 1) % cfg.retrieval.log_every == 0 or it == 0):
                 print(f"[{phase}] ep={epoch} step={it+1}/{steps_per_epoch} lr={lr:.2e} "
-                      f"loss={float(res['loss']):.4f} nce={float(res['nce']):.4f} "
-                      f"acc={float(res['acc']):.3f} filip_pos={float(res['filip_pos']):.4f} "
-                      f"recon={float(res['recon']):.4f} tau={core.logit_scale.exp().item():.2f}",
+                      f"loss={res['loss'].item():.4f} nce={res['nce'].item():.4f} "
+                      f"acc={res['acc'].item():.3f} filip_pos={res['filip_pos'].item():.4f} "
+                      f"recon={res['recon'].item():.4f} tau={core.logit_scale.exp().item():.2f}",
                       flush=True)
 
         if env.is_main:
