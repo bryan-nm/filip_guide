@@ -67,7 +67,7 @@ job_banner "filip_guide retrieval training (src.train_retrieval)" \
     FILIP_CHUNK_ROWS VAL_SUBSET
 
 "${MPI_LAUNCH[@]}" \
-    python -m src.train_retrieval --device xpu --resume auto \
+    python -m src.train_retrieval --device xpu \
         --ckpt-dir "${CKPT_DIR}" \
         --batch-size "${BATCH_SIZE}" --group-size "${GROUP_SIZE}" \
         --phase1-epochs "${PHASE1_EPOCHS}" --phase2-epochs "${PHASE2_EPOCHS}" \
