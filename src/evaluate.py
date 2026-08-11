@@ -110,9 +110,15 @@ def retrieval_metrics(z_p, mask_p, z_t, mask_t, acc_ids, txt_ids,
     Cx = up @ ut.t()
     N = up.size(0)
     off = ~torch.eye(N, dtype=torch.bool, device=up.device)
+    # Retrieval scored by the POOLED cosine instead of token-max FILIP — the A/B
+    # that says whether the late-interaction scorer is the retrieval bottleneck.
+    pool_p2t = _recall_at_k(Cx, rel)
+    pool_t2p = _recall_at_k(Cx.t(), rel.t())
     return {
         "p2t_R@1": p2t[1], "p2t_R@5": p2t[5], "p2t_R@10": p2t[10], "p2t_mAP": _map(S, rel),
         "t2p_R@1": t2p[1], "t2p_R@5": t2p[5], "t2p_R@10": t2p[10], "t2p_mAP": _map(S.t(), rel.t()),
+        "pool_p2t_R@1": pool_p2t[1], "pool_p2t_R@5": pool_p2t[5], "pool_p2t_mAP": _map(Cx, rel),
+        "pool_t2p_R@1": pool_t2p[1], "pool_t2p_mAP": _map(Cx.t(), rel.t()),
         "pos": pos, "neg": neg, "gap": pos - neg,
         "cos_pos": Cx.diagonal().mean().item(),
         "cos_neg": Cx[~rel].mean().item() if (~rel).any() else 0.0,

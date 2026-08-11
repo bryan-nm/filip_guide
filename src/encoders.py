@@ -231,7 +231,7 @@ def _load_esmc_tokenizer(path: str):
         return PreTrainedTokenizerFast.from_pretrained(path)
 
 
-def load_protein_encoder(path: str, device: torch.device):
+def _load_esmc_encoder(path: str, device: torch.device):
     """Load frozen ESM-C via transformers `AutoModelForMaskedLM` + its tokenizer.
 
     Importing `esm` registers the `esmc` architecture into transformers. The
@@ -259,7 +259,123 @@ def load_protein_encoder(path: str, device: torch.device):
 
     for p in model.parameters():
         p.requires_grad_(False)
+    model._filip_encoder_kind = "esmc"
     return model, tok
+
+
+# ---------------------------------------------------------------------------
+# Protein encoder: SaAMPLIFY-350M (guidance classifier; ported from mini-embed)
+# ---------------------------------------------------------------------------
+# AMPLIFY is NOT generative — it's used only as the FILIP classifier. Its remote
+# code imports `xformers.ops` at module top and reshapes attention output with a
+# `.view` that a plain SDPA layout breaks; we stub xformers and swap in a
+# view-safe / XPU-safe attention on non-CUDA hosts, exactly as mini-embed does.
+def _install_xformers_stub_if_missing() -> bool:
+    try:
+        import xformers  # noqa: F401
+        import xformers.ops  # noqa: F401
+        return False
+    except Exception:
+        pass
+    import types
+
+    class _StubSwiGLU(nn.Module):
+        def __init__(self, in_features, hidden_features, out_features, bias=False):
+            super().__init__()
+            self.w12 = nn.Linear(in_features, 2 * hidden_features, bias=bias)
+            self.w3 = nn.Linear(hidden_features, out_features, bias=bias)
+
+        def forward(self, x):
+            import torch.nn.functional as F
+            x1, x2 = self.w12(x).chunk(2, dim=-1)
+            return self.w3(F.silu(x1) * x2)
+
+    def _stub_mea(*a, **k):
+        raise RuntimeError("xformers.memory_efficient_attention unavailable on non-CUDA.")
+
+    xf = types.ModuleType("xformers")
+    xf_ops = types.ModuleType("xformers.ops")
+    xf_ops.SwiGLU = _StubSwiGLU
+    xf_ops.memory_efficient_attention = _stub_mea
+    xf.ops = xf_ops
+    sys.modules["xformers"] = xf
+    sys.modules["xformers.ops"] = xf_ops
+    return True
+
+
+def _view_safe(out: torch.Tensor) -> torch.Tensor:
+    """Return `out` [B,H,M,K] with a stride whose `.transpose(1,2)` is contiguous,
+    so AMPLIFY-350M's `sdpa(...).transpose(1,2).view(...)` doesn't raise."""
+    return out.transpose(1, 2).contiguous().transpose(1, 2)
+
+
+def _manual_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
+                 is_causal=False, scale=None, **kwargs):
+    """Plain matmul+softmax attention (XPU IPEX-safe at any length)."""
+    import torch.nn.functional as F
+    scale = (query.size(-1) ** -0.5) if scale is None else scale
+    scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+    if attn_mask is not None:
+        scores = scores + attn_mask
+    attn = torch.softmax(scores, dim=-1)
+    if dropout_p and dropout_p > 0.0:
+        attn = F.dropout(attn, p=dropout_p, training=True)
+    return _view_safe(torch.matmul(attn, value))
+
+
+def _view_safe_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
+                    is_causal=False, scale=None, **kwargs):
+    """Stock torch SDPA returned in a layout AMPLIFY-350M's `.view` accepts."""
+    import torch.nn.functional as F
+    out = F.scaled_dot_product_attention(
+        query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
+        is_causal=is_causal, scale=scale)
+    return _view_safe(out)
+
+
+def _amplify_additive_mask(pad_mask_1_0: torch.Tensor) -> torch.Tensor:
+    """HF 1/0 pad mask -> AMPLIFY additive (0 / -inf). Only PAD is masked;
+    `<mask>` tokens are real positions AMPLIFY attends to."""
+    am = torch.zeros_like(pad_mask_1_0, dtype=torch.float)
+    return am.masked_fill(pad_mask_1_0 == 0, float("-inf"))
+
+
+def _load_amplify_encoder(path: str, device: torch.device):
+    """Load frozen SaAMPLIFY-350M via trust_remote_code (mini-embed-filip parity)."""
+    _install_xformers_stub_if_missing()
+    from transformers import AutoModel, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+    model = AutoModel.from_pretrained(path, trust_remote_code=True).eval().to(device)
+
+    # AMPLIFY stores its RoPE cache as a plain attribute (not a buffer); the
+    # meta-tensor loader leaves it on meta, so re-materialize on device.
+    amp_mod = sys.modules[type(model).__module__]
+    head_dim = model.config.hidden_size // model.config.num_attention_heads
+    model.freqs_cis = amp_mod.precompute_freqs_cis(head_dim, model.config.max_length).to(device)
+
+    # Non-CUDA attention: XPU IPEX segfaults for long seqs -> plain matmul; CPU/MPS
+    # -> view-safe stock SDPA. CUDA takes AMPLIFY's xformers branch, left alone.
+    if device.type == "xpu":
+        amp_mod.scaled_dot_product_attention = _manual_sdpa
+    elif device.type != "cuda":
+        amp_mod.scaled_dot_product_attention = _view_safe_sdpa
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+    model._filip_encoder_kind = "amplify"
+    return model, tok
+
+
+def load_protein_encoder(path: str, device: torch.device, kind: str = "esmc"):
+    """Dispatch to the ESM-C or SaAMPLIFY loader. `kind` comes from
+    `cfg.model.protein_encoder_type`. Both return (frozen model, tokenizer) with
+    `model._filip_encoder_kind` set so `encode_protein_tokens` knows the API."""
+    if kind == "amplify":
+        return _load_amplify_encoder(path, device)
+    if kind == "esmc":
+        return _load_esmc_encoder(path, device)
+    raise ValueError(f"unknown protein_encoder_type {kind!r} (expected 'esmc' or 'amplify')")
 
 
 def _protein_valid_mask(input_ids: torch.Tensor, attention_mask: torch.Tensor,
@@ -301,6 +417,19 @@ def forward_esmc(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
 
 
 @torch.no_grad()
+def _forward_amplify(model, input_ids, attention_mask):
+    """AMPLIFY forward -> last hidden [B,L,960]. Uses an additive pad mask and the
+    optional final layer-norm (mini-embed parity). AMPLIFY is not generative, so
+    no logits are produced."""
+    additive = _amplify_additive_mask(attention_mask)
+    out = model(input_ids=input_ids, attention_mask=additive, output_hidden_states=True)
+    last = out.hidden_states[-1]
+    if getattr(model.config, "layer_norm_before_last_layer", False):
+        last = model.layer_norm_2(last)
+    return last
+
+
+@torch.no_grad()
 def encode_protein_tokens(
     model, tokenizer, input_ids: torch.Tensor, attention_mask: torch.Tensor,
     mask_specials: bool = True, include_masked: bool = False,
@@ -309,9 +438,13 @@ def encode_protein_tokens(
 
     This is the training/guidance entry point: the masking module tokenizes raw
     sequences, replaces a random fraction of residue ids with `<mask>`, then calls
-    here. Returns (h_p [B,L,960], valid_mask [B,L]).
+    here. Returns (h_p [B,L,960], valid_mask [B,L]). Dispatches on the encoder kind
+    (ESM-C uses a 1/0 attention mask; AMPLIFY an additive one).
     """
-    _, last = forward_esmc(model, input_ids, attention_mask)
+    if getattr(model, "_filip_encoder_kind", "esmc") == "amplify":
+        last = _forward_amplify(model, input_ids, attention_mask)
+    else:
+        _, last = forward_esmc(model, input_ids, attention_mask)
     valid = _protein_valid_mask(input_ids, attention_mask, tokenizer,
                                 mask_specials, include_masked)
     return last, valid

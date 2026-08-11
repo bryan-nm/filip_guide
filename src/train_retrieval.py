@@ -151,7 +151,8 @@ def train(cfg: Cfg, args) -> None:
         print("[load] encoders (frozen)...", flush=True)
     tmodel, ttok = encoders.load_text_encoder(cfg.model.text_encoder_path, device,
                                               cfg.data.caption_field_labels)
-    pmodel, ptok = encoders.load_protein_encoder(cfg.model.protein_encoder_path, device)
+    pmodel, ptok = encoders.load_protein_encoder(
+        cfg.model.protein_encoder_path, device, cfg.model.protein_encoder_type)
     model = build_retrieval(cfg).to(device)
     core = model
     if env.distributed:
@@ -159,6 +160,32 @@ def train(cfg: Cfg, args) -> None:
     if env.is_main:
         print(f"[model] trainable params: "
               f"{sum(p.numel() for p in model.parameters()):,}", flush=True)
+
+    # Eval-only: load a checkpoint, score the val split (FILIP vs pooled), exit.
+    # Run single-process (no mpiexec needed): settles the FILIP-vs-pooled question
+    # on an already-trained checkpoint without retraining.
+    if args.eval_only:
+        ck = torch.load(args.eval_only, map_location=device)
+        core.load_state_dict(ck["model_state"])   # restores centering buffers too
+        model.eval()
+        m = evaluate.evaluate_loader(
+            pmodel, ptok, tmodel, ttok, core, eval_pack["proteins"], eval_pack["texts"],
+            eval_pack["acc_ids"], eval_pack["txt_ids"], device,
+            cfg.data.max_protein_tokens, cfg.data.max_text_tokens,
+            chunk=cfg.retrieval.batch_size, reveal=None,
+            include_masked_in_score=cfg.mask.include_masked_in_score)
+        if env.is_main:
+            print(f"[eval-only] {args.eval_only}  (n={m['n']})", flush=True)
+            print(f"[eval-only] FILIP  p2t R@1={m['p2t_R@1']:.3f} R@5={m['p2t_R@5']:.3f} "
+                  f"mAP={m['p2t_mAP']:.3f} t2p R@1={m['t2p_R@1']:.3f}", flush=True)
+            print(f"[eval-only] POOLED p2t R@1={m['pool_p2t_R@1']:.3f} R@5={m['pool_p2t_R@5']:.3f} "
+                  f"mAP={m['pool_p2t_mAP']:.3f} t2p R@1={m['pool_t2p_R@1']:.3f}", flush=True)
+            print(f"[eval-only] geo filip[p={m['pos']:.3f} n={m['neg']:.3f}] "
+                  f"cos[p={m['cos_pos']:.3f} n={m['cos_neg']:.3f}] "
+                  f"aniso[p={m['aniso_p']:.3f} t={m['aniso_t']:.3f}] mgap={m['modality_gap']:.3f}",
+                  flush=True)
+        cleanup()
+        return
 
     ckpt_dir = Path(cfg.retrieval.ckpt_dir)
     total_epochs = cfg.retrieval.phase1_epochs + cfg.retrieval.phase2_epochs
@@ -179,6 +206,7 @@ def train(cfg: Cfg, args) -> None:
         if env.is_main:
             print(f"[resume] auto -> {resume_path or 'no checkpoint, fresh start'}", flush=True)
     if resume_path:
+        # Continue the SAME run: restore weights, optimizer, epoch, schedule.
         ck = torch.load(resume_path, map_location=device)
         core.load_state_dict(ck["model_state"])
         if "optimizer_state" in ck:
@@ -188,15 +216,36 @@ def train(cfg: Cfg, args) -> None:
         log = ck.get("train_log", [])
         if env.is_main:
             print(f"[resume] {resume_path} -> epoch {start_epoch} (gstep={gstep})", flush=True)
-    elif args.center:
-        if env.is_main:
-            print("[center] computing feature means (sharded)...", flush=True)
-        mean_p, mean_t = compute_feature_means(
-            pmodel, ptok, tmodel, ttok, [pairs[i] for i in splits["train"]], env, cfg)
-        core.set_feature_means(mean_p=mean_p, mean_t=mean_t)
-    elif env.is_main:
-        print("[center] WARNING: --no-center; features un-centered, FILIP may collapse.",
-              flush=True)
+    else:
+        # Optionally INITIALIZE weights from a different checkpoint (e.g. a
+        # mini-embed-filip SaAMPLIFY model trained on full sequences) and start a
+        # FRESH schedule at epoch 0 — used to continue-train the FILIP heads under
+        # the mask schedule. Only the model weights transfer (not optimizer/epoch).
+        if args.init_from:
+            ck = torch.load(args.init_from, map_location=device)
+            state = ck.get("model_state", ck)
+            missing, unexpected = core.load_state_dict(state, strict=False)
+            if env.is_main:
+                print(f"[init] weights from {args.init_from} "
+                      f"(missing={len(missing)} unexpected={len(unexpected)})", flush=True)
+                if missing or unexpected:
+                    print(f"[init]   missing={list(missing)[:6]} unexpected={list(unexpected)[:6]}",
+                          flush=True)
+        if args.center:
+            # Recompute means UNDER the mask schedule — critical when init-from
+            # carried a full-sequence mean but we now train masked.
+            if env.is_main:
+                print("[center] computing feature means (sharded, mask schedule)...", flush=True)
+            mean_p, mean_t = compute_feature_means(
+                pmodel, ptok, tmodel, ttok, [pairs[i] for i in splits["train"]], env, cfg)
+            core.set_feature_means(mean_p=mean_p, mean_t=mean_t)
+        elif args.init_from:
+            if env.is_main:
+                print("[center] --no-center: keeping the init checkpoint's feature means.",
+                      flush=True)
+        elif env.is_main:
+            print("[center] WARNING: --no-center; features un-centered, FILIP may collapse.",
+                  flush=True)
 
     reveal_range = (cfg.mask.mask_t_min, cfg.mask.mask_t_max) if cfg.mask.enabled else None
 
@@ -273,8 +322,10 @@ def train(cfg: Cfg, args) -> None:
                 cfg.data.max_protein_tokens, cfg.data.max_text_tokens,
                 chunk=cfg.retrieval.batch_size, reveal=None,
                 include_masked_in_score=cfg.mask.include_masked_in_score)
-            print(f"[val] ep={epoch} p2t R@1={m['p2t_R@1']:.3f} R@5={m['p2t_R@5']:.3f} "
+            print(f"[val] ep={epoch} FILIP  p2t R@1={m['p2t_R@1']:.3f} R@5={m['p2t_R@5']:.3f} "
                   f"mAP={m['p2t_mAP']:.3f} t2p R@1={m['t2p_R@1']:.3f} (n={m['n']})", flush=True)
+            print(f"[val] ep={epoch} POOLED p2t R@1={m['pool_p2t_R@1']:.3f} R@5={m['pool_p2t_R@5']:.3f} "
+                  f"mAP={m['pool_p2t_mAP']:.3f} t2p R@1={m['pool_t2p_R@1']:.3f}", flush=True)
             print(f"[geo] ep={epoch} filip[p={m['pos']:.3f} n={m['neg']:.3f} gap={m['gap']:.3f}] "
                   f"cos[p={m['cos_pos']:.3f} n={m['cos_neg']:.3f}] "
                   f"aniso[p={m['aniso_p']:.3f} t={m['aniso_t']:.3f}] "
@@ -315,6 +366,11 @@ def main() -> None:
     ap.add_argument("--no-center", dest="center", action="store_false")
     ap.add_argument("--no-save", dest="save", action="store_false")
     ap.add_argument("--resume", default=None, help="path to an epochNN.pt to resume from")
+    ap.add_argument("--init-from", default=None,
+                    help="initialize FILIP heads from a checkpoint (e.g. a mini-embed-filip "
+                         "SaAMPLIFY model) then train a FRESH schedule under the mask schedule")
+    ap.add_argument("--eval-only", default=None,
+                    help="path to a checkpoint: score the val split (FILIP vs pooled) and exit")
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--group-size", type=int, default=None)
     ap.add_argument("--phase1-epochs", type=int, default=None)

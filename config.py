@@ -38,10 +38,15 @@ DATA_CSV = os.environ.get(
     f"{DATASETS_DIR}/SwissProt_full/fully_annotated_swiss_prot_080326.csv",
 )
 
-# ESM-C is loaded through the transformers API (AutoModelForMaskedLM); the `esm`
-# package (pip install esm@git+https://github.com/Biohub/esm.git) must be present
-# to register the `esmc` architecture. See src/encoders.py.
+# Protein encoder. Two kinds are supported (FILIPG_PROTEIN_ENCODER_TYPE):
+#   "esmc"    - ESM-C 300M via transformers AutoModelForMaskedLM (needs the `esm`
+#               package to register the `esmc` arch). This is ALSO the generator.
+#   "amplify" - SaAMPLIFY-350M via trust_remote_code (mini-embed-filip's encoder).
+#               Used as the guidance CLASSIFIER only (not generative); we can
+#               initialize its FILIP heads from a mini-embed-filip checkpoint and
+#               continue-train under the mask schedule. Both are 960-d hidden.
 PROTEIN_ENCODER_PATH = os.environ.get("FILIPG_PROTEIN_ENCODER", f"{MODELS_DIR}/ESMC-300M")
+PROTEIN_ENCODER_TYPE = os.environ.get("FILIPG_PROTEIN_ENCODER_TYPE", "esmc")
 TEXT_ENCODER_PATH = os.environ.get("FILIPG_TEXT_ENCODER", f"{MODELS_DIR}/BioLinkBERT-base")
 
 
@@ -74,8 +79,9 @@ class DataCfg:
 class ModelCfg:
     text_encoder_path: str = TEXT_ENCODER_PATH
     protein_encoder_path: str = PROTEIN_ENCODER_PATH
+    protein_encoder_type: str = PROTEIN_ENCODER_TYPE   # "esmc" | "amplify"
     text_hidden: int = 768                    # BioLinkBERT-base
-    protein_hidden: int = 960                 # ESM-C 300M (d_model)
+    protein_hidden: int = 960                 # ESM-C 300M / SaAMPLIFY-350M (both 960-d)
 
     proj_d_hidden: int = 512
     proj_d_mid: int = 256
@@ -202,6 +208,7 @@ def resolved_paths(cfg: Cfg | None = None) -> dict:
         "datasets_dir": DATASETS_DIR,
         "text_encoder": cfg.model.text_encoder_path,
         "protein_encoder": cfg.model.protein_encoder_path,
+        "protein_encoder_type": cfg.model.protein_encoder_type,   # not a path
         "data_csv": cfg.data.csv_path,
         "ckpt_dir": cfg.retrieval.ckpt_dir,
     }
@@ -212,7 +219,9 @@ def describe_paths(cfg: Cfg | None = None) -> str:
     width = max(len(k) for k in paths)
     lines = []
     for k, v in paths.items():
-        mark = "" if Path(v).exists() else "   [MISSING]"
+        # Only flag [MISSING] for actual filesystem paths, not scalar settings.
+        is_path = "/" in str(v)
+        mark = "" if (not is_path or Path(v).exists()) else "   [MISSING]"
         lines.append(f"{k:<{width}} = {v}{mark}")
     return "\n".join(lines)
 

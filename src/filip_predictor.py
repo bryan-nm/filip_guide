@@ -116,7 +116,8 @@ def build_predictor_from_checkpoint(
     """
     from .model import load_retrieval
     filip_model = load_retrieval(ckpt_path, device, cfg, freeze=True)
-    pmodel, ptok = encoders.load_protein_encoder(cfg.model.protein_encoder_path, device)
+    pmodel, ptok = encoders.load_protein_encoder(
+        cfg.model.protein_encoder_path, device, cfg.model.protein_encoder_type)
     return FilipPredictor(
         filip_model, pmodel, ptok, device,
         mode=mode or cfg.guidance.likelihood_mode,

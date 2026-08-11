@@ -1,0 +1,86 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N filip_amplify_masked
+#PBS -l walltime=03:00:00
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q capacity
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m be
+
+# ---------------------------------------------------------------------------
+# Continue-train the SaAMPLIFY FILIP classifier under the MASK schedule.
+#
+# Why: the SaAMPLIFY FILIP model reaches mAP ~0.77 but was trained only on
+# FULL-length sequences. Guidance scores PARTIAL (masked) sequences, so we warm-
+# start from that checkpoint (--init-from) and fine-tune the projection heads on
+# t~Unif[0,1) masking so the classifier tolerates partial inputs. AMPLIFY stays
+# frozen; ESM-C is not loaded here (it's the generator, used later at guidance).
+#
+# This run uses plain masked R2 InfoNCE (no decoy/hard-negative mining — that
+# machinery isn't ported to filip_guide), so retrieval on full sequences may dip
+# slightly from 0.77; the goal is mask-robustness. Watch the recall-vs-mask curve
+# and the [geo] line.
+# ---------------------------------------------------------------------------
+
+MASTER_PORT=29503
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./pbs_common.sh
+
+# --- intentional cross-encoder override -----------------------------------
+# config.py owns paths, but the FILIPG_* env vars are its documented escape hatch
+# and config READS them, so `python config.py` (bannered below) still records the
+# truth. Point the protein encoder at SaAMPLIFY and select the amplify code path.
+export FILIPG_PROTEIN_ENCODER=/flare/NLDesignProtein/bryan/FILIP-dev-space/models/SaAMPLIFY_350M
+export FILIPG_PROTEIN_ENCODER_TYPE=amplify
+
+# ===========================================================================
+# Inputs / outputs
+# ===========================================================================
+# The mini-embed-filip SaAMPLIFY checkpoint to warm-start from (its FILIP heads
+# load directly — same MiniEmbedFilip architecture; embed_dim MUST match
+# config.ModelCfg.embed_dim=16, else load_state_dict errors on shape).
+INIT_FROM=/flare/NLDesignProtein/bryan/FILIP-dev-space/small_scale_training/mini-embed-filip/checkpoints/hard_negatives/epoch49.pt
+CKPT_DIR=checkpoints/amplify_masked
+require_files INIT_FROM
+
+# ===========================================================================
+# Hyperparameters (fine-tune from a strong warm start)
+# ===========================================================================
+BATCH_SIZE=16          # AMPLIFY-350M live forward per XPU tile; raise to 32 if memory allows
+GROUP_SIZE=16          # 16 x 16 = 256 negatives
+PHASE1_EPOCHS=0        # skip R1 warmup — already warm
+PHASE2_EPOCHS=8
+LR=5e-5                # low, fine-tune LR — do not clobber the 0.77 representation
+# Output-space regularization, kept LIGHT. The heavy-mask failure looks like an
+# anisotropy collapse (aniso_p 0.67 at t=0.25), but re-centering / spreading the
+# embeddings did NOT recover retrieval (it's frozen-encoder info loss, not a
+# geometry artifact), so uniformity is NOT the lever here. Keep it small so it
+# doesn't distort the already-strong t>=0.5 regime; the InfoNCE (256 negatives)
+# carries the discrimination.
+R2_UNIFORMITY_WEIGHT=0.05
+ALIGN_AUX_WEIGHT=0.1
+FILIP_CHUNK_ROWS=8
+VAL_SUBSET=500
+
+# ===========================================================================
+command -v slack >/dev/null 2>&1 && slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+job_banner "filip_guide SaAMPLIFY masked continue-training (src.train_retrieval)" \
+    INIT_FROM CKPT_DIR BATCH_SIZE GROUP_SIZE PHASE1_EPOCHS PHASE2_EPOCHS LR \
+    R2_UNIFORMITY_WEIGHT ALIGN_AUX_WEIGHT FILIP_CHUNK_ROWS VAL_SUBSET
+
+# --init-from applies only on the first launch (no checkpoint yet); --resume auto
+# takes over on re-submit so a walltime-capped run continues cleanly.
+"${MPI_LAUNCH[@]}" \
+    python -m src.train_retrieval --device xpu --resume auto --init-from "${INIT_FROM}" \
+        --ckpt-dir "${CKPT_DIR}" \
+        --batch-size "${BATCH_SIZE}" --group-size "${GROUP_SIZE}" \
+        --phase1-epochs "${PHASE1_EPOCHS}" --phase2-epochs "${PHASE2_EPOCHS}" \
+        --lr "${LR}" \
+        --r2-uniformity-weight "${R2_UNIFORMITY_WEIGHT}" \
+        --align-aux-weight "${ALIGN_AUX_WEIGHT}" \
+        --filip-chunk-rows "${FILIP_CHUNK_ROWS}" --val-subset "${VAL_SUBSET}"
+
+finish $?
