@@ -1,0 +1,85 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N filip_generate
+#PBS -l walltime=01:00:00
+#PBS -l select=4
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q capacity
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m be
+
+# ---------------------------------------------------------------------------
+# Prompt-guided generation over 100 held-out SwissProt entries, for structural
+# eval (fold true + generated with ESMfold, compare with TM-align).
+#
+# Cross-model DEG: ESM-C is the generator (unconditional prior); the mask-robust
+# SaAMPLIFY-FILIP checkpoint is the classifier. For each entry we take its caption
+# as the prompt and generate a sequence of the SAME length as the true sequence,
+# emitting true + guided + unconditional (gamma=0 baseline).
+#
+# Embarrassingly parallel: entries are sharded across ranks (no process group).
+# 'test' split is held out from the filip_guide masked fine-tune (same build_splits
+# seed). Output: runs/<name>/{results.jsonl, true.fasta, generated.fasta,
+# unconditional.fasta}.
+# ---------------------------------------------------------------------------
+
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./pbs_common.sh
+
+# --- cross-encoder override: classifier = SaAMPLIFY (amplify code path); the
+# generator is ESM-C (GuidanceCfg.generator_path default, override with
+# FILIPG_GENERATOR_ENCODER). config.py READS these, so the banner records truth.
+export FILIPG_PROTEIN_ENCODER=/flare/NLDesignProtein/bryan/FILIP-dev-space/models/SaAMPLIFY_350M
+export FILIPG_PROTEIN_ENCODER_TYPE=amplify
+
+# ===========================================================================
+# Inputs / outputs
+# ===========================================================================
+# The MASK-ROBUST classifier (from train_amplify_masked.pbs). Use the mask-fine-
+# tuned checkpoint, NOT the original full-length hard-neg one — generation scores
+# partially-masked sequences.
+CKPT=checkpoints/amplify_masked/epoch49.pt
+RUN_BASE=runs/gen100
+BANK=cache/prompt_bank.pt
+require_files CKPT
+
+# ===========================================================================
+# Generation parameters
+# ===========================================================================
+N_ENTRIES=100
+# softmax_bank is the right likelihood: sigmoid(a*s) saturates to ~0 at the trained
+# scale, giving a FLAT per-candidate signal (verified: no steering at gamma=1).
+# softmax_bank stays informative and steers monotonically with gamma.
+LIKELIHOOD=softmax_bank
+GAMMAS="1 10 100"       # sweep; each writes runs/gen100_g<G>. TM-align picks the sweet spot.
+TEMPERATURE=1.0         # 1.0 = sample the exact guided posterior; lower = sharper/greedier
+MAX_LEN=400             # skip longer entries (bounds runtime; keeps true/gen length matched)
+SPLIT=test
+BANK_SIZE=2000
+
+# ===========================================================================
+command -v slack >/dev/null 2>&1 && slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
+job_banner "filip_guide guided generation sweep (src.generate_dataset)" \
+    CKPT RUN_BASE BANK N_ENTRIES LIKELIHOOD GAMMAS TEMPERATURE MAX_LEN SPLIT BANK_SIZE
+
+# Build the reference prompt bank ONCE (single process), reused by every gamma.
+python -m src.generate_dataset --build-bank --ckpt "${CKPT}" --prompt-bank "${BANK}" \
+    --bank-size "${BANK_SIZE}" --device xpu
+rc=$?
+
+for G in ${GAMMAS}; do
+    [ "$rc" -eq 0 ] || break
+    OUT_DIR="${RUN_BASE}_g${G}"
+    echo "=================  gamma=${G}  ->  ${OUT_DIR}  ================="
+    "${MPI_LAUNCH[@]}" \
+        python -m src.generate_dataset --ckpt "${CKPT}" --out-dir "${OUT_DIR}" \
+            --n-entries "${N_ENTRIES}" --split "${SPLIT}" --max-len "${MAX_LEN}" \
+            --gamma "${G}" --likelihood "${LIKELIHOOD}" --prompt-bank "${BANK}" \
+            --temperature "${TEMPERATURE}" --device xpu
+    rc=$?
+    [ "$rc" -eq 0 ] && { python -m src.generate_dataset --merge --out-dir "${OUT_DIR}"; rc=$?; }
+done
+
+finish $rc

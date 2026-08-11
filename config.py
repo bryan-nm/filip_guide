@@ -49,6 +49,12 @@ PROTEIN_ENCODER_PATH = os.environ.get("FILIPG_PROTEIN_ENCODER", f"{MODELS_DIR}/E
 PROTEIN_ENCODER_TYPE = os.environ.get("FILIPG_PROTEIN_ENCODER_TYPE", "esmc")
 TEXT_ENCODER_PATH = os.environ.get("FILIPG_TEXT_ENCODER", f"{MODELS_DIR}/BioLinkBERT-base")
 
+# The GENERATOR is always ESM-C (the unconditional prior p(x)); guidance decodes
+# from it regardless of which encoder the FILIP CLASSIFIER uses. Kept separate
+# from PROTEIN_ENCODER_PATH because in the cross-model setup the classifier is
+# SaAMPLIFY while the generator is ESM-C.
+GENERATOR_ENCODER_PATH = os.environ.get("FILIPG_GENERATOR_ENCODER", f"{MODELS_DIR}/ESMC-300M")
+
 
 @dataclass
 class DataCfg:
@@ -167,7 +173,8 @@ class GuidanceCfg:
     ProteinGuide MLM/AO-ARM guidance: decode from ESM-C by masked iterative
     unmasking; at each decoded position reweight the prior by p(prompt | x)^gamma.
     """
-    retrieval_ckpt: str = ""                  # trained retrieval checkpoint
+    retrieval_ckpt: str = ""                  # trained FILIP classifier checkpoint
+    generator_path: str = GENERATOR_ENCODER_PATH   # ESM-C, the unconditional prior
     ckpt_dir: str = str(REPO_ROOT / "checkpoints" / "generation")
     device: str = "auto"
 

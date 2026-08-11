@@ -209,7 +209,17 @@ is the prompt→sequence CLI.
    uniform log(1/M) baseline, as expected). Ranking quality awaits a trained
    checkpoint. `scale = exp(logit_scale)` is the trained temperature.
 4. **Guided generation** — `esmc_generative.py`, `guide.py` (DEG), `sample.py`,
-   `generate.py`; qualitative: does prompt steer sequence content?
+   `generate.py`. **[DONE]** Cross-model DEG: ESM-C generator (prior) + AMPLIFY-
+   FILIP classifier via `bridge.py` (ESM-C↔AMPLIFY token id map) + Bayes reweight
+   `log p(x̃|x) + γ·log p(prompt|x̃)`, fixed γ. Verified end-to-end: guided samples
+   score +1.6 nats higher logp(prompt|seq) than the γ=0 baseline (the built-in
+   self-check in `generate.py`). Run:
+   `python -m src.generate --prompt "..." --ckpt <classifier.pt> --gamma 1
+   --likelihood sigmoid --also-unconditional`. Candidate set = 20 canonical AAs;
+   one generator forward + one classifier forward (batch=#candidates) per decoded
+   position; ascending (default) or random decode order. NOTE: softmax_bank mode
+   needs a prompt bank built from the classifier checkpoint (prompt_bank.py);
+   sigmoid mode needs none.
 5. **Eval + scale** — recall metrics, guidance ablations (γ, τ, softmax-vs-
    sigmoid, exclude-vs-include masked as a flag), PBS training run.
    **[distributed trainer + PBS DONE]** `src/train_retrieval.py` is now
