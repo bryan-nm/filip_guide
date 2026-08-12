@@ -2,10 +2,10 @@
 #PBS -A NLDesignProtein
 #PBS -N filip_generate
 #PBS -l walltime=01:00:00
-#PBS -l select=4
+#PBS -l select=2
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
-#PBS -q capacity
+#PBS -q debug
 #PBS -j oe
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m be
@@ -57,7 +57,10 @@ GAMMAS="1 10 100"       # sweep; each writes runs/gen100_g<G>. TM-align picks th
 TEMPERATURE=1.0         # 1.0 = sample the exact guided posterior; lower = sharper/greedier
 MAX_LEN=400             # skip longer entries (bounds runtime; keeps true/gen length matched)
 SPLIT=test
-BANK_SIZE=2000
+# 512 (not 2000): the softmax_bank partition doesn't need a huge bank, and bank
+# size scales the per-position FILIP cost + memory linearly. The predictor also
+# chunks the bank scoring (bank_chunk) so it can't OOM regardless.
+BANK_SIZE=512
 
 # ===========================================================================
 command -v slack >/dev/null 2>&1 && slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"

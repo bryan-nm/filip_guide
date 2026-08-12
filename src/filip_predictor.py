@@ -39,6 +39,7 @@ class FilipPredictor:
         include_masked_in_score: bool = False,
         sigmoid_a: Optional[float] = None,   # default: trained scale
         sigmoid_b: float = 0.0,
+        bank_chunk: int = 128,
     ):
         assert mode in ("softmax_bank", "sigmoid"), mode
         self.filip = filip_model.eval()
@@ -47,6 +48,10 @@ class FilipPredictor:
         self.device = device
         self.mode = mode
         self.include_masked_in_score = include_masked_in_score
+        # Score the bank in blocks of this many prompts so the FILIP transient
+        # [B_p, chunk, L_p, L_t] stays bounded (the full [B_p, M, L_p, L_t] tensor
+        # OOMs an XPU tile at M=2000 and long sequences).
+        self.bank_chunk = int(bank_chunk)
         self.scale = float(filip_model.logit_scale.exp().item())
         self.sigmoid_a = self.scale if sigmoid_a is None else float(sigmoid_a)
         self.sigmoid_b = float(sigmoid_b)
@@ -102,9 +107,22 @@ class FilipPredictor:
 
         # softmax_bank: normalize scale*s over {target} ∪ bank.
         assert self._z_t_bank is not None, "softmax_bank mode needs a prompt bank"
-        s_bank = filip_score_matrix(z_p, self._z_t_bank, mask_p, self._mask_t_bank)  # [B, M]
+        s_bank = self._bank_scores(z_p, mask_p)                                      # [B, M]
         logits = self.scale * torch.cat([s_target[:, None], s_bank], dim=1)          # [B, 1+M]
         return logits[:, 0] - torch.logsumexp(logits, dim=1)
+
+    @torch.no_grad()
+    def _bank_scores(self, z_p, mask_p) -> torch.Tensor:
+        """FILIP scores of `z_p` against the whole bank -> [B, M], computed in
+        prompt-blocks of `bank_chunk` to bound the [B, chunk, L_p, L_t] transient."""
+        M = self._z_t_bank.size(0)
+        step = self.bank_chunk
+        if step <= 0 or step >= M:
+            return filip_score_matrix(z_p, self._z_t_bank, mask_p, self._mask_t_bank)
+        outs = [filip_score_matrix(z_p, self._z_t_bank[s:s + step], mask_p,
+                                   self._mask_t_bank[s:s + step])
+                for s in range(0, M, step)]
+        return torch.cat(outs, dim=1)
 
 
 def build_predictor_from_checkpoint(
