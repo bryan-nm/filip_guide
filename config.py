@@ -49,11 +49,17 @@ PROTEIN_ENCODER_PATH = os.environ.get("FILIPG_PROTEIN_ENCODER", f"{MODELS_DIR}/E
 PROTEIN_ENCODER_TYPE = os.environ.get("FILIPG_PROTEIN_ENCODER_TYPE", "esmc")
 TEXT_ENCODER_PATH = os.environ.get("FILIPG_TEXT_ENCODER", f"{MODELS_DIR}/BioLinkBERT-base")
 
-# The GENERATOR is always ESM-C (the unconditional prior p(x)); guidance decodes
-# from it regardless of which encoder the FILIP CLASSIFIER uses. Kept separate
-# from PROTEIN_ENCODER_PATH because in the cross-model setup the classifier is
-# SaAMPLIFY while the generator is ESM-C.
+# The GENERATOR is the unconditional prior p(x) that guidance decodes from,
+# separate from the FILIP CLASSIFIER's encoder. Two generators are supported:
+#   "esm3" - ESM3-sm (esm3-sm-open-v1) via the `esm` package. An actual generative
+#            model (masked/any-order sequence design); the ProteinGuide paper's
+#            unconditional sequence generator. Preferred — ESM-C folds poorly.
+#   "esmc" - ESM-C 300M via transformers (representation model; kept for A/B).
+# Both share the EsmSequenceTokenizer, so the classifier + tokenizer bridge are
+# identical for either generator.
+GENERATOR_TYPE = os.environ.get("FILIPG_GENERATOR_TYPE", "esm3")
 GENERATOR_ENCODER_PATH = os.environ.get("FILIPG_GENERATOR_ENCODER", f"{MODELS_DIR}/ESMC-300M")
+ESM3_GENERATOR_PATH = os.environ.get("FILIPG_ESM3_PATH", f"{MODELS_DIR}/esm3-sm-open-v1")
 
 
 @dataclass
@@ -174,7 +180,9 @@ class GuidanceCfg:
     unmasking; at each decoded position reweight the prior by p(prompt | x)^gamma.
     """
     retrieval_ckpt: str = ""                  # trained FILIP classifier checkpoint
-    generator_path: str = GENERATOR_ENCODER_PATH   # ESM-C, the unconditional prior
+    generator_type: str = GENERATOR_TYPE      # "esm3" | "esmc"
+    generator_path: str = GENERATOR_ENCODER_PATH   # ESM-C path (generator_type="esmc")
+    esm3_path: str = ESM3_GENERATOR_PATH           # ESM3 path (generator_type="esm3")
     ckpt_dir: str = str(REPO_ROOT / "checkpoints" / "generation")
     device: str = "auto"
 

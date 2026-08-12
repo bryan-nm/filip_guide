@@ -14,10 +14,15 @@
 # Prompt-guided generation over 100 held-out SwissProt entries, for structural
 # eval (fold true + generated with ESMfold, compare with TM-align).
 #
-# Cross-model DEG: ESM-C is the generator (unconditional prior); the mask-robust
-# SaAMPLIFY-FILIP checkpoint is the classifier. For each entry we take its caption
-# as the prompt and generate a sequence of the SAME length as the true sequence,
-# emitting true + guided + unconditional (gamma=0 baseline).
+# Cross-model DEG: ESM3-sm is the generator (unconditional prior; an actual
+# generative model — ESM-C folded poorly), the mask-robust SaAMPLIFY-FILIP
+# checkpoint is the classifier. For each entry we take its caption as the prompt
+# and generate a sequence of the SAME length as the true sequence, emitting true +
+# guided + unconditional (gamma=0 baseline).
+#
+# NOTE: ESM3-1.4B fp32 is ~4-5x heavier than ESM-C-300M, so this is slower — the
+# debug queue / select=2 / short walltime below is for a smoke check; for the full
+# 3-gamma x 100-entry run use the prod queue with more nodes and 03:00:00+.
 #
 # Embarrassingly parallel: entries are sharded across ranks (no process group).
 # 'test' split is held out from the filip_guide masked fine-tune (same build_splits
@@ -28,11 +33,14 @@
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./pbs_common.sh
 
-# --- cross-encoder override: classifier = SaAMPLIFY (amplify code path); the
-# generator is ESM-C (GuidanceCfg.generator_path default, override with
-# FILIPG_GENERATOR_ENCODER). config.py READS these, so the banner records truth.
+# --- model selection (config.py READS these FILIPG_* vars, so the banner records
+# the truth). Classifier = SaAMPLIFY (amplify code path); generator = ESM3-sm.
 export FILIPG_PROTEIN_ENCODER=/flare/NLDesignProtein/bryan/FILIP-dev-space/models/SaAMPLIFY_350M
 export FILIPG_PROTEIN_ENCODER_TYPE=amplify
+export FILIPG_GENERATOR_TYPE=esm3
+ESM3_PATH=/flare/NLDesignProtein/bryan/FILIP-dev-space/models/esm3-sm-open-v1
+export FILIPG_ESM3_PATH="${ESM3_PATH}"
+require_files ESM3_PATH   # the esm3-sm-open-v1 snapshot (data/weights/...) must be present
 
 # ===========================================================================
 # Inputs / outputs
@@ -48,7 +56,7 @@ require_files CKPT
 # ===========================================================================
 # Generation parameters
 # ===========================================================================
-N_ENTRIES=100
+N_ENTRIES=10
 # softmax_bank is the right likelihood: sigmoid(a*s) saturates to ~0 at the trained
 # scale, giving a FLAT per-candidate signal (verified: no steering at gamma=1).
 # softmax_bank stays informative and steers monotonically with gamma.

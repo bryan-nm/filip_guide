@@ -30,7 +30,7 @@ from src import encoders, prompt_bank
 from src.bridge import TokenizerBridge
 from src.data import build_splits, load_pairs
 from src.dist import barrier, init_distributed
-from src.esmc_generative import ESMCGenerator
+from src.esm3_generative import build_generator
 from src.filip_predictor import build_predictor_from_checkpoint
 from src.guide import DEGGuidance
 from src.model import load_retrieval
@@ -107,8 +107,9 @@ def generate(args) -> None:
     env = init_distributed(args.device, init_pg=False)   # rank/world only, no process group
     device = env.device
     if env.is_main:
-        print(f"[gen] world={env.world_size} device={device} gamma={args.gamma} "
-              f"likelihood={args.likelihood} n={args.n_entries} uncond={args.uncond}", flush=True)
+        print(f"[gen] world={env.world_size} device={device} generator={cfg.guidance.generator_type} "
+              f"gamma={args.gamma} likelihood={args.likelihood} n={args.n_entries} "
+              f"uncond={args.uncond}", flush=True)
         os.makedirs(args.out_dir, exist_ok=True)
     barrier()
 
@@ -118,7 +119,7 @@ def generate(args) -> None:
         print(f"[gen] {len(entries)} entries selected from split '{args.split}' "
               f"(len {args.min_len}-{args.max_len}); ~{len(mine)}/rank", flush=True)
 
-    generator = ESMCGenerator.load(cfg.guidance.generator_path, device)
+    generator = build_generator(cfg, device)
     predictor = build_predictor_from_checkpoint(args.ckpt, cfg, device, mode=args.likelihood)
     tmodel, ttok = encoders.load_text_encoder(cfg.model.text_encoder_path, device,
                                               cfg.data.caption_field_labels)

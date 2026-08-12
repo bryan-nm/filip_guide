@@ -20,7 +20,7 @@ import torch
 from config import default_cfg
 from src import encoders
 from src.bridge import TokenizerBridge
-from src.esmc_generative import ESMCGenerator
+from src.esm3_generative import build_generator
 from src.filip_predictor import build_predictor_from_checkpoint
 from src.guide import DEGGuidance
 from src.sample import guided_generate
@@ -71,8 +71,8 @@ def main() -> None:
     print(f"[gen] device={device} gamma={args.gamma} likelihood={args.likelihood} "
           f"length={args.length} n={args.n}", flush=True)
 
-    # Generator (ESM-C) and classifier (AMPLIFY-FILIP from the checkpoint).
-    generator = ESMCGenerator.load(cfg.guidance.generator_path, device)
+    # Generator (ESM3 or ESM-C) and classifier (AMPLIFY-FILIP from the checkpoint).
+    generator = build_generator(cfg, device)
     predictor = build_predictor_from_checkpoint(args.ckpt, cfg, device, mode=args.likelihood)
     predictor.set_target(args.prompt, *_load_text(cfg, device), cfg.data.max_text_tokens)
     if args.likelihood == "softmax_bank":
