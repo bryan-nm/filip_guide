@@ -17,12 +17,47 @@ cast to fp32 for a consistent dtype (ESM3's forward mixes fp32 plddt features).
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 
 from .encoders import _silence_stdout
 from .esmc_generative import CANONICAL_AA, ESMCGenerator
+
+
+def _patch_esm3_xpu_autocast() -> None:
+    """Teach esm's `fp32_autocast_context` about XPU.
+
+    ESM3.forward runs the structure `affine3d` geometry even for sequence-only
+    inputs, and that code calls `fp32_autocast_context(device.type)`, which only
+    knows cpu/mps/cuda and RAISES `ValueError: Unsupported device type: xpu` on
+    Aurora. Its sole purpose is to stop AMP from downcasting the geometry to
+    bf16/fp16; our ESM3 model is entirely fp32 and we run no autocast, so a no-op
+    (like the existing MPS branch) is correct. Idempotent; patches both the misc
+    module and any name already imported into affine3d.
+    """
+    try:
+        from esm.utils import misc as _misc
+    except Exception:
+        return
+    if getattr(_misc, "_filipg_xpu_patched", False):
+        return
+    _orig = _misc.fp32_autocast_context
+
+    def _patched(device_type):
+        if device_type == "xpu":
+            return nullcontext()
+        return _orig(device_type)
+
+    _misc.fp32_autocast_context = _patched
+    _misc._filipg_xpu_patched = True
+    try:  # affine3d may hold its own `from ... import fp32_autocast_context`
+        from esm.utils.structure import affine3d as _aff
+        if hasattr(_aff, "fp32_autocast_context"):
+            _aff.fp32_autocast_context = _patched
+    except Exception:
+        pass
 
 
 class ESM3Generator:
@@ -46,6 +81,7 @@ class ESM3Generator:
             _C.data_root = lambda model=None: Path(path)
         except Exception:
             pass
+        _patch_esm3_xpu_autocast()   # ESM3's structure geometry raises on XPU otherwise
         with _silence_stdout():
             from esm.models.esm3 import ESM3
             from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
