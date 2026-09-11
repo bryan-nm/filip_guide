@@ -41,11 +41,20 @@ class DEGGuidance:
         self.candidate_ids = torch.tensor(ids, dtype=torch.long, device=generator.device)
 
     @torch.no_grad()
-    def guided_position_logprobs(self, x: torch.Tensor, attn: torch.Tensor,
-                                 pos: int) -> torch.Tensor:
+    def guided_position_logprobs(self, x: torch.Tensor, attn: torch.Tensor, pos: int,
+                                 *, return_components: bool = False):
         """Unnormalized guided log-probs over the candidate residues at `pos`.
 
         x, attn: [B, L] current ESM-C ids + attention. Returns [B, C].
+
+        With `return_components`, returns the triple (guided, prior, logp_y) — all
+        [B, C] — so the sampler can accumulate the GENERATOR's own log-likelihood
+        of the token it commits (the AO-ARM path log-likelihood, used for best-of-n
+        selection) without a second forward. `prior` entries are full-vocabulary
+        log-softmax values restricted to the candidate columns, NOT renormalized
+        over the 20 residues, so their sum is a genuine model log p(x) under the
+        decode order: a position where ESM3 wanted a non-residue token is penalized.
+        `logp_y` is None at gamma=0 (the classifier is never called).
         """
         B, L = x.shape
         cand = self.candidate_ids
@@ -54,7 +63,7 @@ class DEGGuidance:
         # Unconditional prior over candidates at this position (one ESM-C forward).
         prior = self.generator.log_probs(x, attn)[:, pos, :][:, cand]   # [B, C]
         if self.gamma == 0.0:
-            return prior
+            return (prior, prior, None) if return_components else prior
 
         # Build the C candidate sequences per row (fill `pos` with each residue).
         xC = x[:, None, :].expand(B, C, L).clone()
@@ -66,4 +75,5 @@ class DEGGuidance:
         cls_ids = self.bridge.convert(xC)
         logp_y = self.predictor.log_prob(cls_ids, attnC).reshape(B, C)   # [B, C]
 
-        return prior + self.gamma * logp_y
+        guided = prior + self.gamma * logp_y
+        return (guided, prior, logp_y) if return_components else guided

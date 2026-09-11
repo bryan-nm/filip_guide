@@ -39,7 +39,8 @@ class FilipPredictor:
         include_masked_in_score: bool = False,
         sigmoid_a: Optional[float] = None,   # default: trained scale
         sigmoid_b: float = 0.0,
-        bank_chunk: int = 128,
+        bank_chunk: int = 32,
+        row_chunk: int = 32,
     ):
         assert mode in ("softmax_bank", "sigmoid"), mode
         self.filip = filip_model.eval()
@@ -52,6 +53,11 @@ class FilipPredictor:
         # [B_p, chunk, L_p, L_t] stays bounded (the full [B_p, M, L_p, L_t] tensor
         # OOMs an XPU tile at M=2000 and long sequences).
         self.bank_chunk = int(bank_chunk)
+        # ...and split the batch axis too. Best-of-n makes B_p = n_candidates * 20
+        # (200 rows at n=10), which blows up BOTH the protein-encoder activations
+        # and that same transient; row_chunk caps the per-block cost so n scales
+        # in wall clock rather than in peak memory. <=0 disables.
+        self.row_chunk = int(row_chunk)
         self.scale = float(filip_model.logit_scale.exp().item())
         self.sigmoid_a = self.scale if sigmoid_a is None else float(sigmoid_a)
         self.sigmoid_b = float(sigmoid_b)
@@ -99,7 +105,18 @@ class FilipPredictor:
 
     @torch.no_grad()
     def log_prob(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """log p(target prompt | sequence) for each row -> [B]."""
+        """log p(target prompt | sequence) for each row -> [B], in row-blocks of
+        `row_chunk` so a large candidate batch cannot OOM."""
+        B = input_ids.size(0)
+        step = self.row_chunk
+        if step <= 0 or step >= B:
+            return self._log_prob_block(input_ids, attention_mask)
+        return torch.cat([self._log_prob_block(input_ids[s:s + step], attention_mask[s:s + step])
+                          for s in range(0, B, step)], dim=0)
+
+    @torch.no_grad()
+    def _log_prob_block(self, input_ids: torch.Tensor,
+                        attention_mask: torch.Tensor) -> torch.Tensor:
         s_target, z_p, mask_p = self.similarity(input_ids, attention_mask)
 
         if self.mode == "sigmoid":
@@ -139,4 +156,6 @@ def build_predictor_from_checkpoint(
     return FilipPredictor(
         filip_model, pmodel, ptok, device,
         mode=mode or cfg.guidance.likelihood_mode,
-        include_masked_in_score=cfg.mask.include_masked_in_score)
+        include_masked_in_score=cfg.mask.include_masked_in_score,
+        bank_chunk=cfg.guidance.bank_chunk,
+        row_chunk=cfg.guidance.classifier_row_chunk)

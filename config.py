@@ -61,6 +61,12 @@ GENERATOR_TYPE = os.environ.get("FILIPG_GENERATOR_TYPE", "esm3")
 GENERATOR_ENCODER_PATH = os.environ.get("FILIPG_GENERATOR_ENCODER", f"{MODELS_DIR}/ESMC-300M")
 ESM3_GENERATOR_PATH = os.environ.get("FILIPG_ESM3_PATH", f"{MODELS_DIR}/esm3-sm-open-v1")
 
+# Guidance-time memory bounds. Overridable from the PBS scripts because the safe
+# values depend on n_candidates (the classifier batch is n_candidates * 20 rows)
+# and on the host's per-tile HBM, not on anything in the model config.
+BANK_CHUNK = int(os.environ.get("FILIPG_BANK_CHUNK", "32"))
+CLASSIFIER_ROW_CHUNK = int(os.environ.get("FILIPG_CLASSIFIER_ROW_CHUNK", "32"))
+
 
 @dataclass
 class DataCfg:
@@ -195,6 +201,31 @@ class GuidanceCfg:
     gamma: float = 1.0                        # guidance strength exponent (paper: 1/10/100)
     sample_temperature: float = 0.1
     deterministic_order: bool = True          # ascending-position decode order
+
+    # Best-of-n sampling. n candidates are drawn as ONE batched decode and the
+    # winner is picked by `select_by`:
+    #   "path_logp"  — generator (ESM3) AO-ARM log-likelihood of the candidate.
+    #                  Free (falls out of the guided score) and independent of both
+    #                  the FILIP guidance objective and the ESMfold/TM-align eval,
+    #                  so it does not make the conditioned-vs-unconditioned
+    #                  comparison circular. The default.
+    #   "filip_logp" — log p(prompt | seq) from the guidance classifier. Circular:
+    #                  it is the steering objective, and applying it to the gamma=0
+    #                  arm (required to keep the arms matched) smuggles conditioning
+    #                  into the control. Diagnostic only.
+    #   "joint_logp" — path_logp + gamma * filip_logp, i.e. the sampler's own
+    #                  posterior objective; reduces to path_logp at gamma=0.
+    #   "first"      — candidate 0, reproducing n=1 for an apples-to-apples delta.
+    n_candidates: int = 1
+    select_by: str = "path_logp"
+    # Likelihood best-of-n rewards low-complexity sequences, so degenerate
+    # candidates are filtered out BEFORE selection (not scored down).
+    max_aa_frac: float = 0.25                 # reject if one residue exceeds this fraction
+    max_homopolymer_run: int = 6              # reject if a single residue repeats > this
+
+    # Memory bounds for the candidate batch (see FilipPredictor).
+    bank_chunk: int = BANK_CHUNK              # prompts per bank-scoring block
+    classifier_row_chunk: int = CLASSIFIER_ROW_CHUNK   # candidate rows per classifier block
 
 
 @dataclass

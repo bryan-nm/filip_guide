@@ -1,11 +1,11 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N filip_generate
-#PBS -l walltime=01:00:00
-#PBS -l select=2
+#PBS -l walltime=06:00:00
+#PBS -l select=9
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
-#PBS -q debug
+#PBS -q prod
 #PBS -j oe
 #PBS -M bryan.andrews.phd@gmail.com
 #PBS -m be
@@ -20,14 +20,25 @@
 # and generate a sequence of the SAME length as the true sequence, emitting true +
 # guided + unconditional (gamma=0 baseline).
 #
-# NOTE: ESM3-1.4B fp32 is ~4-5x heavier than ESM-C-300M, so this is slower — the
-# debug queue / select=2 / short walltime below is for a smoke check; for the full
-# 3-gamma x 100-entry run use the prod queue with more nodes and 03:00:00+.
+# BEST-OF-N: N_CANDIDATES sequences per entry per arm, drawn as ONE batched decode,
+# winner picked by SELECT_BY. Default path_logp = ESM3's own AO-ARM log-likelihood
+# of the candidate, which falls out of the guided score for free and is independent
+# of BOTH the FILIP guidance objective and the ESMfold/TM-align eval — so it does
+# not make the conditioned-vs-unconditioned comparison circular. Selection is
+# applied symmetrically to both arms (same n, temperature and seed), and every
+# candidate is kept in results.jsonl + {generated,unconditional}_all.fasta, so the
+# run can be re-selected offline (or the whole candidate set folded to check the
+# selector against pLDDT) without regenerating.
+#
+# NOTE: ESM3-1.4B fp32 is ~4-5x heavier than ESM-C-300M, and n=10 is ~10x the
+# classifier work of n=1 (the candidate batch is n*20 rows, row-chunked to hold
+# memory flat), so this is ~10x the n=1 wall clock per entry. select=9 gives 108
+# ranks for 100 entries = 1 entry/rank, so walltime is per-entry, not per-run.
 #
 # Embarrassingly parallel: entries are sharded across ranks (no process group).
 # 'test' split is held out from the filip_guide masked fine-tune (same build_splits
 # seed). Output: runs/<name>/{results.jsonl, true.fasta, generated.fasta,
-# unconditional.fasta}.
+# unconditional.fasta, generated_all.fasta, unconditional_all.fasta}.
 # ---------------------------------------------------------------------------
 
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
@@ -49,19 +60,28 @@ require_files ESM3_PATH   # the esm3-sm-open-v1 snapshot (data/weights/...) must
 # tuned checkpoint, NOT the original full-length hard-neg one — generation scores
 # partially-masked sequences.
 CKPT=checkpoints/amplify_masked/epoch49.pt
-RUN_BASE=runs/gen100
+RUN_BASE=runs/gen100_bo10
 BANK=cache/prompt_bank.pt
 require_files CKPT
 
 # ===========================================================================
 # Generation parameters
 # ===========================================================================
-N_ENTRIES=10
+N_ENTRIES=100
+# Best-of-n. path_logp is the selector; 'first' reproduces the n=1 baseline from
+# the same candidate sets if you want the delta computed post hoc instead.
+N_CANDIDATES=10
+SELECT_BY=path_logp
+# Degeneracy filter, applied BEFORE selection: likelihood best-of-n rewards
+# low-complexity sequences (ESM3 at T=1.0 emits the occasional poly-A/poly-K run,
+# and those score high), so gate them out rather than scoring them down.
+MAX_AA_FRAC=0.25
+MAX_RUN=6
 # softmax_bank is the right likelihood: sigmoid(a*s) saturates to ~0 at the trained
 # scale, giving a FLAT per-candidate signal (verified: no steering at gamma=1).
 # softmax_bank stays informative and steers monotonically with gamma.
 LIKELIHOOD=softmax_bank
-GAMMAS="1 10 100"       # sweep; each writes runs/gen100_g<G>. TM-align picks the sweet spot.
+GAMMAS="1 10 100"       # sweep; each writes ${RUN_BASE}_g<G>. TM-align picks the sweet spot.
 TEMPERATURE=1.0         # 1.0 = sample the exact guided posterior; lower = sharper/greedier
 MAX_LEN=400             # skip longer entries (bounds runtime; keeps true/gen length matched)
 SPLIT=test
@@ -69,11 +89,18 @@ SPLIT=test
 # size scales the per-position FILIP cost + memory linearly. The predictor also
 # chunks the bank scoring (bank_chunk) so it can't OOM regardless.
 BANK_SIZE=512
+# At n=10 the classifier batch is 10*20 = 200 rows, which multiplies BOTH the
+# AMPLIFY activations and the FILIP [B_p, bank_chunk, L_p, L_t] transient. 32/32
+# caps the per-block transient at ~[32,32,400,L_t] (<1 GB fp32), so n scales in
+# wall clock instead of peak memory. config.py reads these.
+export FILIPG_BANK_CHUNK=32
+export FILIPG_CLASSIFIER_ROW_CHUNK=32
 
 # ===========================================================================
 command -v slack >/dev/null 2>&1 && slack ":rocket: START ${PBS_JOBID} ${PBS_JOBNAME} on ${NNODES} nodes"
 job_banner "filip_guide guided generation sweep (src.generate_dataset)" \
-    CKPT RUN_BASE BANK N_ENTRIES LIKELIHOOD GAMMAS TEMPERATURE MAX_LEN SPLIT BANK_SIZE
+    CKPT RUN_BASE BANK N_ENTRIES N_CANDIDATES SELECT_BY MAX_AA_FRAC MAX_RUN \
+    LIKELIHOOD GAMMAS TEMPERATURE MAX_LEN SPLIT BANK_SIZE
 
 # Build the reference prompt bank ONCE (single process), reused by every gamma.
 python -m src.generate_dataset --build-bank --ckpt "${CKPT}" --prompt-bank "${BANK}" \
@@ -88,7 +115,9 @@ for G in ${GAMMAS}; do
         python -m src.generate_dataset --ckpt "${CKPT}" --out-dir "${OUT_DIR}" \
             --n-entries "${N_ENTRIES}" --split "${SPLIT}" --max-len "${MAX_LEN}" \
             --gamma "${G}" --likelihood "${LIKELIHOOD}" --prompt-bank "${BANK}" \
-            --temperature "${TEMPERATURE}" --device xpu
+            --temperature "${TEMPERATURE}" --device xpu \
+            --n-candidates "${N_CANDIDATES}" --select-by "${SELECT_BY}" \
+            --max-aa-frac "${MAX_AA_FRAC}" --max-run "${MAX_RUN}"
     rc=$?
     [ "$rc" -eq 0 ] && { python -m src.generate_dataset --merge --out-dir "${OUT_DIR}"; rc=$?; }
 done
