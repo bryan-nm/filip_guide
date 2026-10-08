@@ -402,6 +402,31 @@ def _protein_valid_mask(input_ids: torch.Tensor, attention_mask: torch.Tensor,
     return valid & ~spec
 
 
+def _forward_esmc_impl(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+    """The ESM-C forward itself, with NO grad decision baked in.
+
+    The `_impl` split exists because TAG guidance (src/pld2_guidance.py) needs this
+    exact forward WITH a graph, to differentiate log p(prompt | x) with respect to
+    the input embeddings, while every other caller wants it under no_grad. Keeping
+    one body and two entry points means the two cannot drift — a second copy of
+    "which forward, which mask, which final layer-norm" is precisely the thing that
+    would rot and then be wrong only in the guidance path.
+    """
+    out = model(input_ids=input_ids, attention_mask=attention_mask,
+                output_hidden_states=True)
+    return out.logits, out.hidden_states[-1]
+
+
+def _forward_amplify_impl(model, input_ids, attention_mask):
+    """The AMPLIFY forward itself (additive pad mask + optional final layer-norm)."""
+    additive = _amplify_additive_mask(attention_mask)
+    out = model(input_ids=input_ids, attention_mask=additive, output_hidden_states=True)
+    last = out.hidden_states[-1]
+    if getattr(model.config, "layer_norm_before_last_layer", False):
+        last = model.layer_norm_2(last)
+    return last
+
+
 @torch.no_grad()
 def forward_esmc(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
     """One frozen ESM-C forward -> (logits [B,L,64], last_hidden [B,L,960]).
@@ -411,9 +436,7 @@ def forward_esmc(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
     the FILIP protein feature. Sharing this forward is the whole point of using
     ESM-C as both generator and encoder.
     """
-    out = model(input_ids=input_ids, attention_mask=attention_mask,
-                output_hidden_states=True)
-    return out.logits, out.hidden_states[-1]
+    return _forward_esmc_impl(model, input_ids, attention_mask)
 
 
 @torch.no_grad()
@@ -421,12 +444,20 @@ def _forward_amplify(model, input_ids, attention_mask):
     """AMPLIFY forward -> last hidden [B,L,960]. Uses an additive pad mask and the
     optional final layer-norm (mini-embed parity). AMPLIFY is not generative, so
     no logits are produced."""
-    additive = _amplify_additive_mask(attention_mask)
-    out = model(input_ids=input_ids, attention_mask=additive, output_hidden_states=True)
-    last = out.hidden_states[-1]
-    if getattr(model.config, "layer_norm_before_last_layer", False):
-        last = model.layer_norm_2(last)
-    return last
+    return _forward_amplify_impl(model, input_ids, attention_mask)
+
+
+def _encode_protein_tokens_impl(
+    model, tokenizer, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+    mask_specials: bool = True, include_masked: bool = False,
+):
+    if getattr(model, "_filip_encoder_kind", "esmc") == "amplify":
+        last = _forward_amplify_impl(model, input_ids, attention_mask)
+    else:
+        _, last = _forward_esmc_impl(model, input_ids, attention_mask)
+    valid = _protein_valid_mask(input_ids, attention_mask, tokenizer,
+                                mask_specials, include_masked)
+    return last, valid
 
 
 @torch.no_grad()
@@ -441,13 +472,25 @@ def encode_protein_tokens(
     here. Returns (h_p [B,L,960], valid_mask [B,L]). Dispatches on the encoder kind
     (ESM-C uses a 1/0 attention mask; AMPLIFY an additive one).
     """
-    if getattr(model, "_filip_encoder_kind", "esmc") == "amplify":
-        last = _forward_amplify(model, input_ids, attention_mask)
-    else:
-        _, last = forward_esmc(model, input_ids, attention_mask)
-    valid = _protein_valid_mask(input_ids, attention_mask, tokenizer,
-                                mask_specials, include_masked)
-    return last, valid
+    return _encode_protein_tokens_impl(model, tokenizer, input_ids, attention_mask,
+                                       mask_specials, include_masked)
+
+
+def encode_protein_tokens_grad(
+    model, tokenizer, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+    mask_specials: bool = True, include_masked: bool = False,
+):
+    """`encode_protein_tokens` WITHOUT no_grad, for TAG's backward pass.
+
+    Identical computation; the only difference is that the autograd graph survives.
+    The encoder's own parameters are frozen (requires_grad False), so nothing here
+    accumulates parameter gradients — the graph exists solely so a hook on the input
+    embedding can collect d log p(prompt | x) / d e_i. Callers are responsible for
+    wrapping this in `torch.enable_grad()` when the surrounding sampler runs under
+    no_grad, which PLD2's does.
+    """
+    return _encode_protein_tokens_impl(model, tokenizer, input_ids, attention_mask,
+                                       mask_specials, include_masked)
 
 
 @torch.no_grad()

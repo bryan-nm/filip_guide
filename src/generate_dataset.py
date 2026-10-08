@@ -182,6 +182,23 @@ def generate(args) -> None:
     cfg = default_cfg()
     env = init_distributed(args.device, init_pg=False)   # rank/world only, no process group
     device = env.device
+
+    # This driver is the AO-ARM pipeline: it decodes through src/sample.py and its
+    # best-of-n selector ranks candidates by the generator's own path
+    # log-likelihood. Neither exists for PLD2 — it commits many positions per step,
+    # so there is no decode path to accumulate, and PLD2's own alignment work
+    # measured that ranking ITS samples by model likelihood is 5-40x worse than an
+    # external scorer and below a random draw at low guidance. So PLD2 generation
+    # is single-draw here and selection belongs downstream, at the ESMFold/TM-align
+    # stage where pLDDT already tracks the oracle. Refuse up front rather than
+    # failing deep in the loop.
+    if cfg.guidance.generator_type == "pld2":
+        raise SystemExit(
+            "generator_type='pld2' is not supported by src.generate_dataset: it "
+            "drives the AO-ARM sampler and selects best-of-n by generator path "
+            "log-likelihood, and PLD2 has neither. Use `python -m src.generate "
+            "--generator pld2` for single draws and rank the results at the folding "
+            "stage instead.")
     if env.is_main:
         print(f"[gen] world={env.world_size} device={device} generator={cfg.guidance.generator_type} "
               f"gamma={args.gamma} likelihood={args.likelihood} n={args.n_entries} "

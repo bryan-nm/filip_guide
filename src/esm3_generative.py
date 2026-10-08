@@ -122,10 +122,20 @@ class ESM3Generator:
 
 
 def build_generator(cfg, device):
-    """Factory: return the generator selected by cfg.guidance.generator_type."""
+    """Factory: return the generator selected by cfg.guidance.generator_type.
+
+    Note that "pld2" is not interchangeable with the other two at the SAMPLER
+    level: ESM3/ESM-C are masked LMs decoded by src/sample.py's AO-ARM loop, while
+    PLD2 is a parallel-decode diffusion model that runs its own sampler. Callers
+    must dispatch on `generator_type` for generation, not just for loading — see
+    src/pld2_generative.py.
+    """
+    if cfg.guidance.generator_type == "pld2":
+        from .pld2_generative import build_pld2_generator
+        return build_pld2_generator(cfg, device)
     if cfg.guidance.generator_type == "esm3":
         return ESM3Generator.load(cfg.guidance.esm3_path, device)
     if cfg.guidance.generator_type == "esmc":
         return ESMCGenerator.load(cfg.guidance.generator_path, device)
     raise ValueError(f"unknown generator_type {cfg.guidance.generator_type!r} "
-                     f"(expected 'esm3' or 'esmc')")
+                     f"(expected 'pld2', 'esm3' or 'esmc')")

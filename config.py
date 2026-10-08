@@ -50,16 +50,35 @@ PROTEIN_ENCODER_TYPE = os.environ.get("FILIPG_PROTEIN_ENCODER_TYPE", "esmc")
 TEXT_ENCODER_PATH = os.environ.get("FILIPG_TEXT_ENCODER", f"{MODELS_DIR}/BioLinkBERT-base")
 
 # The GENERATOR is the unconditional prior p(x) that guidance decodes from,
-# separate from the FILIP CLASSIFIER's encoder. Two generators are supported:
+# separate from the FILIP CLASSIFIER's encoder. Three generators are supported:
+#   "pld2" - PLD2, a looped bidirectional DISCRETE-DIFFUSION protein generator
+#            (sibling repo). Unlike the two below it is not a masked LM decoded
+#            one position at a time: it decodes a fixed 512 canvas in parallel,
+#            committing the most confident edits per step (MaskGIT-style), and it
+#            carries a second 3Di structure track that co-decodes with the
+#            sequence. So it does NOT go through src/sample.py's AO-ARM loop —
+#            filip_guide drives PLD2's own sampler through its `guidance_fn`
+#            logit hook. See src/pld2_generative.py.
 #   "esm3" - ESM3-sm (esm3-sm-open-v1) via the `esm` package. An actual generative
 #            model (masked/any-order sequence design); the ProteinGuide paper's
 #            unconditional sequence generator. Preferred — ESM-C folds poorly.
 #   "esmc" - ESM-C 300M via transformers (representation model; kept for A/B).
-# Both share the EsmSequenceTokenizer, so the classifier + tokenizer bridge are
-# identical for either generator.
+# esm3/esmc share the EsmSequenceTokenizer, so the classifier + tokenizer bridge
+# are identical for either; PLD2 has its own 23-token vocabulary, bridged by a
+# tokenizer shim in src/pld2_generative.py (the bridge itself is unchanged).
 GENERATOR_TYPE = os.environ.get("FILIPG_GENERATOR_TYPE", "esm3")
 GENERATOR_ENCODER_PATH = os.environ.get("FILIPG_GENERATOR_ENCODER", f"{MODELS_DIR}/ESMC-300M")
 ESM3_GENERATOR_PATH = os.environ.get("FILIPG_ESM3_PATH", f"{MODELS_DIR}/esm3-sm-open-v1")
+
+# PLD2 lives in its own repo and is IMPORTED, not vendored — the same call PLD2
+# itself makes for mini-embed-filip (its config.MINI_EMBED_REPO). PLD2 is actively
+# trained, so a vendored copy of its trunk would rot; and the subgraph we need
+# (src/model.py, src/sampler.py, src/corruption.py) imports nothing but stdlib and
+# torch, so there is none of the env-conflict risk that made the `esm`-package
+# dependency a problem. Loaded under the module alias `pld2_src` because PLD2's
+# package is ALSO called `src` — see src/pld2_generative.load_pld2_package.
+PLD2_REPO = os.environ.get("FILIPG_PLD2_REPO", str(REPO_ROOT.parent / "PLD2"))
+PLD2_CKPT = os.environ.get("FILIPG_PLD2_CKPT", str(REPO_ROOT.parent / "PLD2" / "ali_r10_step499.ckpt"))
 
 # Guidance-time memory bounds. Overridable from the PBS scripts because the safe
 # values depend on n_candidates (the classifier batch is n_candidates * 20 rows)
@@ -186,9 +205,11 @@ class GuidanceCfg:
     unmasking; at each decoded position reweight the prior by p(prompt | x)^gamma.
     """
     retrieval_ckpt: str = ""                  # trained FILIP classifier checkpoint
-    generator_type: str = GENERATOR_TYPE      # "esm3" | "esmc"
+    generator_type: str = GENERATOR_TYPE      # "pld2" | "esm3" | "esmc"
     generator_path: str = GENERATOR_ENCODER_PATH   # ESM-C path (generator_type="esmc")
     esm3_path: str = ESM3_GENERATOR_PATH           # ESM3 path (generator_type="esm3")
+    pld2_repo: str = PLD2_REPO                     # PLD2 checkout (generator_type="pld2")
+    pld2_ckpt: str = PLD2_CKPT                     # PLD2 weights
     ckpt_dir: str = str(REPO_ROOT / "checkpoints" / "generation")
     device: str = "auto"
 
@@ -227,6 +248,36 @@ class GuidanceCfg:
     bank_chunk: int = BANK_CHUNK              # prompts per bank-scoring block
     classifier_row_chunk: int = CLASSIFIER_ROW_CHUNK   # candidate rows per classifier block
 
+    # --- PLD2 generator (generator_type="pld2") ---------------------------
+    # PLD2 decodes a fixed canvas in PARALLEL, so its guidance hook is called once
+    # per step with the whole canvas. Exact per-candidate DEG would then be
+    # L * C classifier forwards per step (~5M per sample at 512x20), so guidance
+    # here is TAG: ONE classifier forward + backward per step scores every
+    # (position, residue) at once via the input-embedding gradient, at a cost
+    # independent of length. This mirrors what PLD2 runs in production.
+    pld2_guide_mode: str = "tag"              # "tag" (first-order) — DEG is not viable here
+    # The gradient's SCALE moves by orders of magnitude across a decode (it depends
+    # on how many positions are committed), so an unnormalized gamma would mean
+    # something different at every step. Standardizing across the 20 candidates
+    # puts gamma in logit units; the per-position mean cancels under the softmax.
+    pld2_tag_normalize: bool = True
+    pld2_tag_chunk: int = 8                   # candidate rows per classifier fwd+bwd
+
+    # Sampler settings. Defaults are the ones the attached checkpoint's own run
+    # used (PLD2 config.py sample_* / gen_* at the r10 alignment round), so a
+    # filip_guide decode matches the regime the policy was tuned in.
+    pld2_canvas: int = 512                    # fixed decode width (PLD2 DataCfg.canvas)
+    pld2_steps: int = 512                     # decode steps (cosine commit schedule)
+    pld2_temperature: float = 1.0
+    pld2_gumbel_temp: float = 0.1             # stochastic edit ORDER (MaskGIT)
+    pld2_subst_per_residue: float = 1.0       # substitution budget; 0 = absorbing-only
+    pld2_rep_penalty: float = 0.0             # PLD2's own repetition guidance (composes before ours)
+    pld2_max_run: int = 5                     # hard homopolymer run cap in the sampler
+    pld2_min_len: int = 30                    # EOS floor
+    pld2_eos_first: bool = True               # commit the length before any residue
+    pld2_struct_first: float = 0.0            # fraction of steps biased toward the 3Di track
+    pld2_n_recurrence: int = 0                # 0 = use the checkpoint's own (1 at 1.35B)
+
 
 @dataclass
 class Cfg:
@@ -255,9 +306,21 @@ def resolved_paths(cfg: Cfg | None = None) -> dict:
         "text_encoder": cfg.model.text_encoder_path,
         "protein_encoder": cfg.model.protein_encoder_path,
         "protein_encoder_type": cfg.model.protein_encoder_type,   # not a path
+        # The generative prior is a separate model from the classifier's encoder,
+        # and which one a run decoded from is the first thing a result needs.
+        "generator_type": cfg.guidance.generator_type,            # not a path
+        "generator": _generator_path(cfg),
         "data_csv": cfg.data.csv_path,
         "ckpt_dir": cfg.retrieval.ckpt_dir,
     }
+
+
+def _generator_path(cfg: Cfg) -> str:
+    """The weights the configured generator will actually load."""
+    return {"pld2": cfg.guidance.pld2_ckpt,
+            "esm3": cfg.guidance.esm3_path,
+            "esmc": cfg.guidance.generator_path}.get(
+                cfg.guidance.generator_type, cfg.guidance.generator_path)
 
 
 def describe_paths(cfg: Cfg | None = None) -> str:

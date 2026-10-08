@@ -118,20 +118,21 @@ class FilipPredictor:
     def _log_prob_block(self, input_ids: torch.Tensor,
                         attention_mask: torch.Tensor) -> torch.Tensor:
         s_target, z_p, mask_p = self.similarity(input_ids, attention_mask)
+        return self._logp_tail(s_target, z_p, mask_p)
 
+    def _logp_tail(self, s_target, z_p, mask_p) -> torch.Tensor:
+        """Similarity -> log p(target | x). Shared by the no_grad and TAG paths so
+        the two likelihood forms are defined exactly once."""
         if self.mode == "sigmoid":
             return F.logsigmoid(self.sigmoid_a * s_target + self.sigmoid_b)
 
         # softmax_bank: normalize scale*s over {target} ∪ bank.
         assert self._z_t_bank is not None, "softmax_bank mode needs a prompt bank"
-        s_bank = self._bank_scores(z_p, mask_p)                                      # [B, M]
+        s_bank = self._bank_scores_impl(z_p, mask_p)                                 # [B, M]
         logits = self.scale * torch.cat([s_target[:, None], s_bank], dim=1)          # [B, 1+M]
         return logits[:, 0] - torch.logsumexp(logits, dim=1)
 
-    @torch.no_grad()
-    def _bank_scores(self, z_p, mask_p) -> torch.Tensor:
-        """FILIP scores of `z_p` against the whole bank -> [B, M], computed in
-        prompt-blocks of `bank_chunk` to bound the [B, chunk, L_p, L_t] transient."""
+    def _bank_scores_impl(self, z_p, mask_p) -> torch.Tensor:
         M = self._z_t_bank.size(0)
         step = self.bank_chunk
         if step <= 0 or step >= M:
@@ -140,6 +141,35 @@ class FilipPredictor:
                                    self._mask_t_bank[s:s + step])
                 for s in range(0, M, step)]
         return torch.cat(outs, dim=1)
+
+    @torch.no_grad()
+    def _bank_scores(self, z_p, mask_p) -> torch.Tensor:
+        """FILIP scores of `z_p` against the whole bank -> [B, M], computed in
+        prompt-blocks of `bank_chunk` to bound the [B, chunk, L_p, L_t] transient."""
+        return self._bank_scores_impl(z_p, mask_p)
+
+    # --- differentiable path (TAG guidance) --------------------------------
+    def log_prob_grad(self, input_ids: torch.Tensor,
+                      attention_mask: torch.Tensor) -> torch.Tensor:
+        """log p(target prompt | sequence) -> [B], WITH an autograd graph.
+
+        Same computation as `log_prob`; the graph survives so TAG can take
+        d log p(prompt | x) / d e_i at the protein encoder's input embedding (see
+        src/pld2_guidance.py). Not row-chunked: TAG's caller chunks rows itself,
+        because for a backward the chunk size is bounded by the attention
+        activations retained per layer, not by the forward's peak.
+
+        The encoder and the FILIP heads are frozen, so this accumulates no
+        parameter gradients — only the input-embedding grad the hook collects.
+        """
+        assert self._z_t_target is not None, "call set_target(...) first"
+        h_p, mask_p = encoders.encode_protein_tokens_grad(
+            self.pmodel, self.ptok, input_ids, attention_mask,
+            include_masked=self.include_masked_in_score)
+        z_p = self.filip.protein_proj(h_p)                                 # [B, Lp, D]
+        s = filip_score_matrix(z_p, self._z_t_target, mask_p,
+                               self._mask_t_target).squeeze(1)             # [B]
+        return self._logp_tail(s, z_p, mask_p)
 
 
 def build_predictor_from_checkpoint(

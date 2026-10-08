@@ -57,36 +57,62 @@ def main() -> None:
     ap.add_argument("--likelihood", default=cfg.guidance.likelihood_mode,
                     choices=["sigmoid", "softmax_bank"])
     ap.add_argument("--prompt-bank", default=cfg.guidance.prompt_bank_path)
-    ap.add_argument("--temperature", type=float, default=cfg.guidance.sample_temperature)
+    # Resolved per generator below: the AO-ARM loop and PLD2's confidence decode
+    # are different samplers and their useful temperatures differ by 10x, so one
+    # shared default would silently misapply to whichever it was not chosen for.
+    ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--order", default="ascending", choices=["ascending", "random"])
     ap.add_argument("--greedy", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--generator", default=cfg.guidance.generator_type,
+                    choices=["pld2", "esm3", "esmc"],
+                    help="unconditional prior p(x) to decode from")
+    ap.add_argument("--pld2-ckpt", default=None,
+                    help="override cfg.guidance.pld2_ckpt (--generator pld2)")
+    ap.add_argument("--pld2-steps", type=int, default=None,
+                    help="override cfg.guidance.pld2_steps (--generator pld2)")
     ap.add_argument("--also-unconditional", action="store_true",
                     help="also generate a gamma=0 baseline for comparison")
     args = ap.parse_args()
 
     device = pick_device(args.device)
     torch.manual_seed(args.seed)
-    print(f"[gen] device={device} gamma={args.gamma} likelihood={args.likelihood} "
-          f"length={args.length} n={args.n}", flush=True)
 
-    # Generator (ESM3 or ESM-C) and classifier (AMPLIFY-FILIP from the checkpoint).
+    # CLI overrides, applied to the cfg so everything downstream sees one source.
+    cfg.guidance.generator_type = args.generator
+    if args.pld2_ckpt:
+        cfg.guidance.pld2_ckpt = args.pld2_ckpt
+    if args.pld2_steps:
+        cfg.guidance.pld2_steps = args.pld2_steps
+    if args.temperature is None:
+        args.temperature = (cfg.guidance.pld2_temperature if args.generator == "pld2"
+                            else cfg.guidance.sample_temperature)
+
+    print(f"[gen] device={device} generator={args.generator} gamma={args.gamma} "
+          f"likelihood={args.likelihood} length={args.length} n={args.n} "
+          f"temperature={args.temperature}", flush=True)
+
+    # Generator (PLD2, ESM3 or ESM-C) and classifier (AMPLIFY-FILIP from the checkpoint).
     generator = build_generator(cfg, device)
     predictor = build_predictor_from_checkpoint(args.ckpt, cfg, device, mode=args.likelihood)
     predictor.set_target(args.prompt, *_load_text(cfg, device), cfg.data.max_text_tokens)
     if args.likelihood == "softmax_bank":
         predictor.load_bank(args.prompt_bank)
 
-    bridge = TokenizerBridge(generator.tok, predictor.ptok).to(device)
+    if args.generator == "pld2":
+        run = _pld2_runner(cfg, generator, predictor, device, args)
+    else:
+        bridge = TokenizerBridge(generator.tok, predictor.ptok).to(device)
 
-    def run(gamma):
-        guidance = DEGGuidance(generator, predictor, bridge, gamma)
-        seqs = guided_generate(generator_seed=args.seed, guidance=guidance, length=args.length,
-                               n=args.n, temperature=args.temperature, order=args.order,
-                               greedy=args.greedy)
-        lp = score_prompt_logprob(predictor, seqs, device)
-        return seqs, lp
+        def run(gamma):
+            guidance = DEGGuidance(generator, predictor, bridge, gamma)
+            seqs = guided_generate(generator_seed=args.seed, guidance=guidance,
+                                   length=args.length, n=args.n,
+                                   temperature=args.temperature, order=args.order,
+                                   greedy=args.greedy)
+            lp = score_prompt_logprob(predictor, seqs, device)
+            return seqs, lp
 
     print(f"\n=== guided (gamma={args.gamma}) ===", flush=True)
     guided_seqs, guided_lp = run(args.gamma)
@@ -102,6 +128,43 @@ def main() -> None:
         print(f"  mean logp(prompt|seq) = {uncond_lp.mean().item():+.3f}", flush=True)
         print(f"\n[gen] guidance shift in mean logp(prompt|seq): "
               f"{(guided_lp.mean() - uncond_lp.mean()).item():+.3f}", flush=True)
+
+
+def _pld2_runner(cfg, generator, predictor, device, args):
+    """A `run(gamma) -> (seqs, logp)` that decodes with PLD2 instead of the AO-ARM loop.
+
+    PLD2 commits many positions per step, so it does not go through
+    src/sample.py; filip_guide supplies the FILIP term through PLD2's own
+    `guidance_fn` logit hook (TAG) and lets PLD2's sampler run. `gamma=0` builds no
+    guidance at all, which is the genuine unconditional baseline: the classifier is
+    never called.
+    """
+    from .pld2_guidance import build_pld2_guidance
+    g = cfg.guidance
+    built = {}
+
+    def run(gamma):
+        guide = None
+        if gamma != 0.0:
+            # Built once and re-used across arms: locating the classifier's input
+            # embedding and reading its residue rows is setup, not per-arm work.
+            if "g" not in built:
+                built["g"] = build_pld2_guidance(predictor, generator, cfg, device,
+                                                 gamma=gamma)
+            guide = built["g"]
+            guide.gamma = float(gamma)
+        torch.manual_seed(args.seed)
+        seqs = generator.generate(
+            n=args.n, guidance_fn=guide, length=args.length,
+            steps=g.pld2_steps, temperature=args.temperature,
+            gumbel_temp=g.pld2_gumbel_temp,
+            subst_per_residue=g.pld2_subst_per_residue,
+            rep_penalty=g.pld2_rep_penalty, max_run=g.pld2_max_run,
+            min_len=g.pld2_min_len, eos_first=g.pld2_eos_first,
+            struct_first=g.pld2_struct_first, greedy=args.greedy)
+        return seqs, score_prompt_logprob(predictor, seqs, device)
+
+    return run
 
 
 def _load_text(cfg, device):
